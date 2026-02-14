@@ -175,6 +175,40 @@ class SpatialMemory:
             f"{nearest.description}"
         )
 
+    # ── Shelter Management (max 3) ──
+
+    MAX_SHELTERS = 3
+
+    def save_shelter(self, x: float, y: float, z: float, description: str = "Shelter") -> str:
+        """Save a shelter location, keeping only the most recent MAX_SHELTERS."""
+        # Find all existing shelter waypoints
+        shelter_names = sorted(
+            [n for n, wp in self.waypoints.items() if wp.category == "shelter"],
+            key=lambda n: self.waypoints[n].created_at,
+        )
+
+        # Delete oldest shelters if at capacity
+        while len(shelter_names) >= self.MAX_SHELTERS:
+            oldest = shelter_names.pop(0)
+            del self.waypoints[oldest]
+            print(f"   🗑️ Removed old shelter '{oldest}'")
+
+        # Generate name
+        existing_nums = []
+        for n in self.waypoints:
+            if n.startswith("shelter"):
+                parts = n.split("_")
+                if len(parts) == 2 and parts[1].isdigit():
+                    existing_nums.append(int(parts[1]))
+                elif n == "shelter":
+                    existing_nums.append(0)
+        next_num = max(existing_nums, default=0) + 1
+        name = f"shelter_{next_num}"
+
+        result = self.save_location(name, "shelter", x, y, z, description)
+        print(f"   📍 Saved shelter as '{name}'")
+        return result
+
     # ── Auto-save from placed blocks ──
 
     def auto_save_placed(self, block_name: str, x: float, y: float, z: float) -> str:

@@ -251,17 +251,18 @@ def create_cozy_base_goal() -> GrandGoal:
     tasks = [
         Task("get_wood", "Get lots of wood", "get_wood",
              phase="gather", completion_items={"oak_planks": 32}),
-        Task("get_stone", "Mine 64+ cobblestone", "build_shelter",
+        Task("get_stone", "Mine 64+ cobblestone", "mine_stone",
              phase="gather", completion_items={"cobblestone": 64}),
         Task("make_crafting_table", "Place crafting table", "make_crafting_table",
              requires=["get_wood"], phase="build",
              completion_blocks_placed=["crafting_table"]),
         Task("build_main_shelter", "Build shelter", "build_shelter",
-             requires=["get_stone"], phase="build"),
-        Task("place_furnace", "Place furnace", "make_iron_pickaxe",  # furnace is a side product
+             requires=["get_stone"], phase="build",
+             completion_blocks_placed=["oak_door"]),
+        Task("place_furnace", "Place furnace", "place_furnace",
              requires=["get_stone"], phase="build",
              completion_blocks_placed=["furnace"]),
-        Task("place_chests", "Place chests", "",
+        Task("place_chests", "Place chests", "place_chest",
              requires=["get_wood"], phase="build",
              completion_blocks_placed=["chest"]),
     ]
@@ -282,11 +283,14 @@ GRAND_GOAL_REGISTRY = {
 class GrandGoalManager:
     SAVE_FILE = "grand_goal_state.json"
 
+    MAX_SKIP_RETRIES = 2  # retry skipped tasks up to 2 more times
+
     def __init__(self):
         self.active_goal: Optional[GrandGoal] = None
         self.completed_goals: list[str] = []
         self.current_task_id: Optional[str] = None
         self.task_fail_count: dict[str, int] = {}  # task_id → consecutive fail count
+        self.skip_retry_count: dict[str, int] = {}  # task_id → how many times retried after skip
         self._load()
 
     def _save(self):
@@ -299,6 +303,7 @@ class GrandGoalManager:
                     "tasks": [{"id": t.id, "status": t.status.value} for t in self.active_goal.tasks],
                     "current_task_id": self.current_task_id,
                     "task_fail_count": self.task_fail_count,
+                    "skip_retry_count": self.skip_retry_count,
                 }
             with open(self.SAVE_FILE, "w") as f:
                 json.dump(data, f, indent=2)
@@ -325,6 +330,7 @@ class GrandGoalManager:
                     self.active_goal.refresh_availability()
                     self.current_task_id = gd.get("current_task_id")
                     self.task_fail_count = gd.get("task_fail_count", {})
+                    self.skip_retry_count = gd.get("skip_retry_count", {})
                     print(f"🏆 Loaded: {self.active_goal.description} ({self.active_goal.overall_progress})")
         except Exception as e:
             print(f"⚠️ Load error: {e}")
@@ -373,26 +379,45 @@ class GrandGoalManager:
         return None
 
     def pick_next_task(self) -> Optional[Task]:
-        """Pick next available task. Returns None if all blocked/done."""
+        """Pick next available task. If none, retry skipped tasks."""
         if not self.active_goal:
             return None
+
         available = self.active_goal.get_available_tasks()
-        if not available:
-            return None
-        # Skip tasks that have failed too many times
-        for task in available:
-            fail_count = self.task_fail_count.get(task.id, 0)
-            if fail_count < 3:
-                task.status = TaskStatus.IN_PROGRESS
-                self.current_task_id = task.id
-                self._save()
-                return task
-        # All available tasks have failed 3+ times → return first anyway
-        task = available[0]
-        task.status = TaskStatus.IN_PROGRESS
-        self.current_task_id = task.id
-        self._save()
-        return task
+
+        # Normal case: pick an available task with low fail count
+        if available:
+            for task in available:
+                fail_count = self.task_fail_count.get(task.id, 0)
+                if fail_count < 3:
+                    task.status = TaskStatus.IN_PROGRESS
+                    self.current_task_id = task.id
+                    self._save()
+                    return task
+            # All available tasks have failed 3+ times → return first anyway
+            task = available[0]
+            task.status = TaskStatus.IN_PROGRESS
+            self.current_task_id = task.id
+            self._save()
+            return task
+
+        # No available tasks → retry skipped tasks that haven't exceeded retry limit
+        skipped = [t for t in self.active_goal.tasks if t.status == TaskStatus.SKIPPED]
+        retryable = [t for t in skipped
+                     if self.skip_retry_count.get(t.id, 0) < self.MAX_SKIP_RETRIES]
+        if retryable:
+            task = retryable[0]
+            retry_num = self.skip_retry_count.get(task.id, 0) + 1
+            self.skip_retry_count[task.id] = retry_num
+            # Reset fail count so it gets 5 more chain attempts
+            self.task_fail_count[task.id] = 0
+            task.status = TaskStatus.IN_PROGRESS
+            self.current_task_id = task.id
+            self._save()
+            print(f"   🔄 Retrying skipped task '{task.id}' (retry {retry_num}/{self.MAX_SKIP_RETRIES})")
+            return task
+
+        return None
 
     def record_task_failure(self, task_id: str):
         """Record a task failure for smart selection."""
@@ -441,6 +466,7 @@ class GrandGoalManager:
         self.active_goal = GRAND_GOAL_REGISTRY[goal_name]()
         self.current_task_id = None
         self.task_fail_count = {}
+        self.skip_retry_count = {}
         self.auto_check_progress()
         self.active_goal.refresh_availability()
         self._save()

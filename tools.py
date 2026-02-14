@@ -415,10 +415,8 @@ def dig_shelter() -> str:
                 from memory_tools import memory
                 state = requests.get(f"{BOT_API}/state", timeout=5).json()
                 pos = state.get("position", {})
-                existing = [n for n in memory.waypoints if n.startswith("shelter")]
-                name = f"shelter_{len(existing) + 1}" if existing else "shelter"
-                memory.save_location(name, "shelter", float(pos["x"]), float(pos["y"]), float(pos["z"]), "Emergency underground shelter")
-                result += f" | 📍 Saved as '{name}'"
+                save_msg = memory.save_shelter(float(pos["x"]), float(pos["y"]), float(pos["z"]), "Emergency underground shelter")
+                result += f" | 📍 {save_msg}"
             except:
                 pass
         return result
@@ -476,16 +474,14 @@ def build_shelter() -> str:
         r = requests.post(f"{BOT_API}/action/build_shelter", timeout=60)
         result = r.json().get("message", "No result")
 
-        # Auto-save shelter location
+        # Auto-save shelter location (max 3)
         if "Built shelter" in result:
             try:
                 from memory_tools import memory
                 state = requests.get(f"{BOT_API}/state", timeout=5).json()
                 pos = state.get("position", {})
-                existing = [n for n in memory.waypoints if n.startswith("shelter")]
-                name = f"shelter_{len(existing) + 1}" if existing else "shelter"
-                memory.save_location(name, "shelter", float(pos["x"]), float(pos["y"]), float(pos["z"]), "Enclosed shelter")
-                result += f" | 📍 Saved as '{name}'"
+                save_msg = memory.save_shelter(float(pos["x"]), float(pos["y"]), float(pos["z"]), "Enclosed shelter")
+                result += f" | 📍 {save_msg}"
             except:
                 pass
 

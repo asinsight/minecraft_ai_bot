@@ -142,17 +142,14 @@ def call_tool(tool_name: str, args: dict, timeout: int = 60) -> dict:
             except Exception:
                 pass
 
-        # Auto-save shelter location
+        # Auto-save shelter location (keep max 3 shelters)
         if tool_name in ("build_shelter", "dig_shelter") and result.get("success"):
             try:
                 from memory_tools import memory
                 state = requests.get(f"{BOT_API}/state", timeout=5).json()
                 pos = state.get("position", {})
-                existing = [n for n in memory.waypoints if n.startswith("shelter")]
-                name = f"shelter_{len(existing) + 1}" if existing else "shelter"
                 desc = "Enclosed shelter" if tool_name == "build_shelter" else "Emergency underground shelter"
-                memory.save_location(name, "shelter", float(pos["x"]), float(pos["y"]), float(pos["z"]), desc)
-                print(f"   📍 Saved shelter as '{name}'")
+                memory.save_shelter(float(pos["x"]), float(pos["y"]), float(pos["z"]), desc)
             except Exception:
                 pass
 
@@ -273,6 +270,13 @@ def check_instinct(state: dict, threat: dict) -> Optional[TickResult]:
         if closest <= 5:
             has_weapon = any(i["name"].endswith(("_sword", "_axe")) for i in inventory)
             if has_weapon:
+                # Auto-equip best weapon before fighting
+                inv_dict = {i["name"]: i["count"] for i in inventory}
+                sword_tiers = ["wooden_sword", "stone_sword", "iron_sword", "diamond_sword"]
+                for sword in reversed(sword_tiers):
+                    if inv_dict.get(sword, 0) > 0:
+                        call_tool("equip_item", {"item_name": sword})
+                        break
                 mob_type = threat_details[0].get("type", "")
                 result = call_tool("attack_entity", {"entity_type": mob_type})
                 return TickResult(0, f"attack_entity({mob_type}) [mob in shelter]",
@@ -293,6 +297,25 @@ class ChainExecutor:
         self.goal_manager = goal_manager
         self.active_chain: Optional[ChainState] = None
         self._in_search_mode = False  # currently executing a search strategy
+
+    def _estimate_chain_timeout(self, chain_name: str, steps: list[dict]) -> float:
+        """Estimate timeout based on chain complexity."""
+        base = 120  # 2 min base
+        for step in steps:
+            tool = step.get("tool", "")
+            if tool == "mine_block":
+                count = int(step.get("args", {}).get("count", 1))
+                base += count * 10  # 10s per block (includes search time)
+            elif tool == "smelt_item":
+                count = int(step.get("args", {}).get("count", 1))
+                base += count * 12  # smelting is slow
+            elif tool in ("dig_down", "dig_tunnel", "build_shelter"):
+                base += 120
+            elif tool in ("craft_item", "place_block", "equip_item"):
+                base += 15
+            else:
+                base += 30
+        return max(300, min(base, 900))  # clamp: 5 min ~ 15 min
 
     def has_active_chain(self) -> bool:
         return self.active_chain is not None and not self.active_chain.is_done
@@ -324,9 +347,14 @@ class ChainExecutor:
         self.active_chain = ChainState(
             chain_name=chain_name,
             steps=steps,
-            timeout=600 if "diamond" in chain_name else 300,
+            timeout=self._estimate_chain_timeout(chain_name, steps),
         )
         self._in_search_mode = False
+
+        # Auto-equip best gear at chain start
+        inv = get_inventory_counts()
+        self._auto_equip_best_gear(inv)
+
         return f"▶️ Started chain: {chain_name} ({len(steps)} steps)"
 
     def cancel_chain(self, reason: str = ""):
@@ -347,13 +375,17 @@ class ChainExecutor:
         if chain.is_timed_out:
             name = chain.chain_name
             self.cancel_chain("timeout")
+            elapsed = int(time.time() - chain.started_at)
             return TickResult(1, "timeout", f"Chain {name} timed out", False,
-                            needs_llm=True, llm_context=f"Chain '{name}' timed out after 5 minutes.")
+                            needs_llm=True, llm_context=f"Chain '{name}' timed out after {elapsed}s (limit: {int(chain.timeout)}s).")
 
         # All steps done
         if chain.is_done:
             name = chain.chain_name
             self.active_chain = None
+            # Auto-equip best gear after chain completion
+            inv = get_inventory_counts()
+            self._auto_equip_best_gear(inv)
             return TickResult(1, "chain_complete", f"Chain '{name}' completed!", True)
 
         step = chain.current_step
@@ -386,6 +418,13 @@ class ChainExecutor:
         # Auto-equip best tool before mining
         if tool_name == "mine_block":
             self._auto_equip_for_mining(tool_args.get("block_type", ""), inventory)
+
+        # Auto-equip best weapon before combat
+        if tool_name == "attack_entity":
+            for sword in reversed(self.SWORD_TIERS):
+                if inventory.get(sword, 0) > 0:
+                    call_tool("equip_item", {"item_name": sword})
+                    break
 
         result = call_tool(tool_name, tool_args)
         success = result.get("success", False)
@@ -488,6 +527,51 @@ class ChainExecutor:
                          f"Need {required_tool} for {block_type}. Injected {prereq_chain_name} ({len(prereq_steps)} steps).",
                          True)
 
+    # Equipment tier order (higher index = better)
+    SWORD_TIERS = ["wooden_sword", "stone_sword", "iron_sword", "diamond_sword"]
+    HELMET_TIERS = ["leather_helmet", "chainmail_helmet", "iron_helmet", "diamond_helmet"]
+    CHESTPLATE_TIERS = ["leather_chestplate", "chainmail_chestplate", "iron_chestplate", "diamond_chestplate"]
+    LEGGINGS_TIERS = ["leather_leggings", "chainmail_leggings", "iron_leggings", "diamond_leggings"]
+    BOOTS_TIERS = ["leather_boots", "chainmail_boots", "iron_boots", "diamond_boots"]
+
+    # Slot → tier list mapping
+    GEAR_SLOTS = {
+        "head": HELMET_TIERS,
+        "torso": CHESTPLATE_TIERS,
+        "legs": LEGGINGS_TIERS,
+        "feet": BOOTS_TIERS,
+    }
+
+    def _auto_equip_best_gear(self, inventory: dict):
+        """Equip the best available gear in all slots (armor, weapon, shield)."""
+        equipped_any = False
+
+        # ── Best sword in hand ──
+        for sword in reversed(self.SWORD_TIERS):
+            if inventory.get(sword, 0) > 0:
+                call_tool("equip_item", {"item_name": sword})
+                print(f"   ⚔️ Auto-equipped {sword}")
+                equipped_any = True
+                break
+
+        # ── Best armor in each slot ──
+        for slot, tiers in self.GEAR_SLOTS.items():
+            for armor in reversed(tiers):
+                if inventory.get(armor, 0) > 0:
+                    call_tool("equip_item", {"item_name": armor, "destination": slot})
+                    print(f"   🛡️ Auto-equipped {armor} → {slot}")
+                    equipped_any = True
+                    break
+
+        # ── Shield in off-hand ──
+        if inventory.get("shield", 0) > 0:
+            call_tool("equip_item", {"item_name": "shield", "destination": "off-hand"})
+            print(f"   🛡️ Auto-equipped shield → off-hand")
+            equipped_any = True
+
+        if equipped_any:
+            print(f"   ✅ Best gear equipped")
+
     def _auto_equip_for_mining(self, block_type: str, inventory: dict):
         """Equip the best available pickaxe before mining."""
         # Find best pickaxe in inventory
@@ -523,9 +607,23 @@ class ChainExecutor:
 
         return False
 
+    # Persistent search: extra dynamic attempts after static strategies
+    MAX_PERSISTENT_SEARCH = 8
+
+    # Ore types that need underground search
+    ORE_SEARCH_Y = {
+        "iron_ore": 16, "deepslate_iron_ore": 0,
+        "coal_ore": 48, "deepslate_coal_ore": 0,
+        "diamond_ore": -58, "deepslate_diamond_ore": -58,
+        "gold_ore": -16, "deepslate_gold_ore": -16,
+        "copper_ore": 48, "lapis_ore": 0,
+        "redstone_ore": -32, "emerald_ore": 16,
+    }
+
     def _handle_search_failure(self, step: dict, error_msg: str,
                                 inventory: dict) -> TickResult:
-        """Handle failure of a search-type step. Tries search strategy."""
+        """Handle failure of a search-type step. Tries search strategy,
+        then persistent exploration, then LLM escalation."""
         chain = self.active_chain
         target = step.get("search_target", step["args"].get("block_type", ""))
 
@@ -535,7 +633,6 @@ class ChainExecutor:
             if hint and hint.get("location"):
                 loc = hint["location"]
                 print(f"   🧠 Experience: {target} was found at ({loc.get('x')}, {loc.get('y')}, {loc.get('z')})")
-                # Move there and retry
                 call_tool("move_to", {"x": loc["x"], "y": loc["y"], "z": loc["z"]})
                 result = call_tool(step["tool"], step["args"])
                 if result.get("success"):
@@ -544,60 +641,99 @@ class ChainExecutor:
                     chain.advance()
                     return TickResult(1, f"search:{target} via memory", result.get("message", ""), True)
 
-        # Get search strategy
+        # ── Phase 1: Static search strategies ──
         strategies = get_search_strategy(target)
-        if chain.search_retry_idx >= len(strategies):
-            # All strategies exhausted → escalate to LLM
-            chain.advance()  # Skip this step, let LLM figure it out
-            return TickResult(1, f"search:{target} exhausted", error_msg, False,
-                            needs_llm=True,
-                            llm_context=f"Cannot find {target}. Tried {len(strategies)} strategies. "
-                                       f"Current inventory: {json.dumps(dict(list(inventory.items())[:15]))}. "
-                                       f"What should I do?")
+        if chain.search_retry_idx < len(strategies):
+            strategy = strategies[chain.search_retry_idx]
+            action_type, action_args = strategy
 
-        # Execute next search strategy
-        strategy = strategies[chain.search_retry_idx]
-        action_type, action_args = strategy
+            print(f"   🔍 Search [{chain.search_retry_idx+1}/{len(strategies)}]: {action_type}({action_args})")
 
-        print(f"   🔍 Search strategy [{chain.search_retry_idx+1}/{len(strategies)}]: {action_type}({action_args})")
+            if action_type == "check_memory":
+                try:
+                    from memory_tools import memory
+                    nearest = memory.find_nearest(action_args.get("category", "resource"))
+                    if "No saved locations" not in nearest and "Cannot" not in nearest:
+                        print(f"   📍 Memory: {nearest[:80]}")
+                except:
+                    pass
+                chain.search_retry_idx += 1
+                return TickResult(1, f"check_memory({action_args})", "Checked memory", True)
 
-        if action_type == "check_memory":
-            # Check spatial memory for saved locations
-            try:
-                from memory_tools import memory
-                nearest = memory.find_nearest(action_args.get("category", "resource"))
-                if "No saved locations" not in nearest and "Cannot" not in nearest:
-                    print(f"   📍 Memory: {nearest[:80]}")
-                    # Parse coordinates and move there — simplified
-            except:
-                pass
+            result = call_tool(action_type, action_args)
+            search_msg = result.get("message", "")
             chain.search_retry_idx += 1
-            return TickResult(1, f"check_memory({action_args})", "Checked memory", True)
 
-        # Execute the search action
-        result = call_tool(action_type, action_args)
-        search_msg = result.get("message", "")
-        chain.search_retry_idx += 1
+            if result.get("success"):
+                found = self._try_find_and_mine(step, target)
+                if found:
+                    return found
 
-        # After search action (dig_down, dig_tunnel, explore), retry the original step
-        if result.get("success"):
-            # Check if target is now findable
-            find_result = call_tool("find_block", {"block_type": target, "max_distance": 32})
-            if find_result.get("success"):
-                # Found it! Now do the original step
-                original_result = call_tool(step["tool"], step["args"])
-                if original_result.get("success"):
-                    # Record success
-                    state = get_bot_state()
-                    pos = state.get("position", {})
-                    location = {"x": float(pos.get("x", 0)), "y": float(pos.get("y", 0)), "z": float(pos.get("z", 0))}
-                    self.experience.record_search_success(target, f"{action_type}:{json.dumps(action_args)}", location)
-                    chain.advance()
-                    return TickResult(1, f"{step['tool']} (after {action_type})",
-                                    original_result.get("message", ""), True)
+            return TickResult(1, f"search:{action_type}({action_args})", search_msg, True)
 
-        # Search action done but target not found yet → next tick will try next strategy
-        return TickResult(1, f"search:{action_type}({action_args})", search_msg, True)
+        # ── Phase 2: Persistent search (dynamic exploration) ──
+        persistent_idx = chain.search_retry_idx - len(strategies)
+        if persistent_idx < self.MAX_PERSISTENT_SEARCH:
+            chain.search_retry_idx += 1
+            is_ore = target in self.ORE_SEARCH_Y
+
+            if is_ore:
+                # Underground ore: alternate dig_down + dig_tunnel in different directions
+                directions = ["north", "east", "south", "west"]
+                direction = directions[persistent_idx % 4]
+                if persistent_idx % 2 == 0:
+                    target_y = self.ORE_SEARCH_Y.get(target, 16)
+                    action = ("dig_down", {"target_y": target_y})
+                else:
+                    length = 15 + (persistent_idx * 3)  # gradually longer tunnels
+                    action = ("dig_tunnel", {"direction": direction, "length": min(length, 40)})
+            else:
+                # Surface resource: explore different distances
+                distance = 30 + (persistent_idx * 15)  # 30, 45, 60, 75...
+                action = ("explore", {"distance": min(distance, 120)})
+
+            action_type, action_args = action
+            print(f"   🔍 Persistent search [{persistent_idx+1}/{self.MAX_PERSISTENT_SEARCH}]: "
+                  f"{action_type}({action_args})")
+
+            result = call_tool(action_type, action_args)
+
+            if result.get("success"):
+                found = self._try_find_and_mine(step, target)
+                if found:
+                    return found
+
+            return TickResult(1, f"persist:{action_type}({action_args})",
+                            result.get("message", ""), True)
+
+        # ── Phase 3: All search exhausted → escalate to LLM ──
+        total_attempts = len(strategies) + self.MAX_PERSISTENT_SEARCH
+        chain.advance()  # Skip this step
+        return TickResult(1, f"search:{target} exhausted", error_msg, False,
+                        needs_llm=True,
+                        llm_context=f"Cannot find {target} after {total_attempts} search attempts "
+                                   f"(static strategies + persistent exploration).\n"
+                                   f"Tried: dig_down, dig_tunnel (all directions), explore (various distances).\n"
+                                   f"Current inventory: {json.dumps(dict(list(inventory.items())[:15]))}.\n"
+                                   f"The chain for this task has failed. Analyze what went wrong and "
+                                   f"try a DIFFERENT approach or chain. Maybe gather prerequisites first, "
+                                   f"or explore a completely new area.")
+
+    def _try_find_and_mine(self, step: dict, target: str) -> Optional[TickResult]:
+        """After a search action, check if the target is now findable and mine it."""
+        find_result = call_tool("find_block", {"block_type": target, "max_distance": 32})
+        if find_result.get("success"):
+            original_result = call_tool(step["tool"], step["args"])
+            if original_result.get("success"):
+                state = get_bot_state()
+                pos = state.get("position", {})
+                location = {"x": float(pos.get("x", 0)), "y": float(pos.get("y", 0)),
+                           "z": float(pos.get("z", 0))}
+                self.experience.record_search_success(target, "persistent_search", location)
+                self.active_chain.advance()
+                return TickResult(1, f"{step['tool']} (found after search)",
+                                original_result.get("message", ""), True)
+        return None
 
     def _handle_step_failure(self, step: dict, error_msg: str,
                               inventory: dict) -> TickResult:

@@ -61,20 +61,24 @@ SEARCH_STRATEGIES = {
         ("find_block", {"block_type": "spruce_log", "max_distance": 64}),
         ("explore", {"distance": 30}),
         ("explore", {"distance": 50}),
+        ("explore", {"distance": 80}),
     ],
     "birch_log": [
         ("find_block", {"block_type": "birch_log", "max_distance": 64}),
         ("find_block", {"block_type": "oak_log", "max_distance": 64}),
         ("explore", {"distance": 30}),
+        ("explore", {"distance": 50}),
     ],
     "spruce_log": [
         ("find_block", {"block_type": "spruce_log", "max_distance": 64}),
         ("find_block", {"block_type": "oak_log", "max_distance": 64}),
         ("explore", {"distance": 30}),
+        ("explore", {"distance": 50}),
     ],
     "stone": [
         ("find_block", {"block_type": "stone", "max_distance": 32}),
         ("dig_down", {"depth": 5}),
+        ("dig_tunnel", {"direction": "north", "length": 10}),
     ],
     "iron_ore": [
         ("find_block", {"block_type": "iron_ore", "max_distance": 64}),
@@ -83,12 +87,22 @@ SEARCH_STRATEGIES = {
         ("dig_tunnel", {"direction": "north", "length": 20}),
         ("dig_tunnel", {"direction": "east", "length": 20}),
         ("dig_tunnel", {"direction": "south", "length": 20}),
+        ("dig_tunnel", {"direction": "west", "length": 20}),
+        ("explore", {"distance": 40}),
+        ("dig_down", {"target_y": 16}),
+        ("dig_tunnel", {"direction": "north", "length": 25}),
+        ("dig_tunnel", {"direction": "east", "length": 25}),
     ],
     "coal_ore": [
         ("find_block", {"block_type": "coal_ore", "max_distance": 64}),
         ("check_memory", {"category": "resource", "keyword": "coal"}),
         ("dig_down", {"target_y": 48}),
         ("dig_tunnel", {"direction": "west", "length": 15}),
+        ("dig_tunnel", {"direction": "north", "length": 15}),
+        ("explore", {"distance": 30}),
+        ("dig_down", {"target_y": 40}),
+        ("dig_tunnel", {"direction": "east", "length": 20}),
+        ("dig_tunnel", {"direction": "south", "length": 20}),
     ],
     "diamond_ore": [
         ("find_block", {"block_type": "diamond_ore", "max_distance": 64}),
@@ -99,30 +113,44 @@ SEARCH_STRATEGIES = {
         ("dig_tunnel", {"direction": "east", "length": 30}),
         ("dig_tunnel", {"direction": "south", "length": 30}),
         ("dig_tunnel", {"direction": "west", "length": 30}),
+        ("explore", {"distance": 40}),
+        ("dig_down", {"target_y": -58}),
+        ("dig_tunnel", {"direction": "north", "length": 40}),
+        ("dig_tunnel", {"direction": "east", "length": 40}),
     ],
     "gold_ore": [
         ("find_block", {"block_type": "gold_ore", "max_distance": 64}),
         ("check_memory", {"category": "resource", "keyword": "gold"}),
         ("dig_down", {"target_y": 16}),
         ("dig_tunnel", {"direction": "north", "length": 20}),
+        ("dig_tunnel", {"direction": "east", "length": 20}),
+        ("explore", {"distance": 30}),
+        ("dig_down", {"target_y": -10}),
+        ("dig_tunnel", {"direction": "south", "length": 25}),
     ],
-    # Animals — wander around looking
+    # Animals — wander around looking more persistently
     "cow": [
         ("explore", {"distance": 30}),
         ("explore", {"distance": 50}),
         ("explore", {"distance": 80}),
+        ("explore", {"distance": 60}),
+        ("explore", {"distance": 100}),
     ],
     "pig": [
         ("explore", {"distance": 30}),
         ("explore", {"distance": 50}),
+        ("explore", {"distance": 80}),
+        ("explore", {"distance": 60}),
     ],
     "chicken": [
         ("explore", {"distance": 30}),
         ("explore", {"distance": 50}),
+        ("explore", {"distance": 80}),
     ],
     "sheep": [
         ("explore", {"distance": 30}),
         ("explore", {"distance": 50}),
+        ("explore", {"distance": 80}),
     ],
 }
 
@@ -196,6 +224,37 @@ CHAIN_LIBRARY = {
          "type": "search", "search_target": "pig"},
         {"tool": "eat_food", "args": {},
          "type": "action"},
+    ],
+
+    "mine_stone": [
+        {"tool": "mine_block", "args": {"block_type": "stone", "count": 32},
+         "type": "search", "skip_if": {"cobblestone": 64},
+         "search_target": "stone"},
+        {"tool": "mine_block", "args": {"block_type": "stone", "count": 32},
+         "type": "search", "skip_if": {"cobblestone": 64},
+         "search_target": "stone"},
+    ],
+
+    "place_furnace": [
+        {"tool": "mine_block", "args": {"block_type": "stone", "count": 8},
+         "type": "search", "skip_if": {"cobblestone": 8, "furnace": 1},
+         "search_target": "stone"},
+        {"tool": "craft_item", "args": {"item_name": "furnace"},
+         "type": "craft", "skip_if": {"furnace": 1}, "skip_if_nearby": "furnace"},
+        {"tool": "place_block", "args": {"block_name": "furnace"},
+         "type": "place", "skip_if_nearby": "furnace"},
+    ],
+
+    "place_chest": [
+        {"tool": "mine_block", "args": {"block_type": "oak_log", "count": 2},
+         "type": "search", "skip_if": {"oak_planks": 8},
+         "search_target": "oak_log"},
+        {"tool": "craft_item", "args": {"item_name": "oak_planks"},
+         "type": "craft", "skip_if": {"oak_planks": 8}},
+        {"tool": "craft_item", "args": {"item_name": "chest"},
+         "type": "craft", "skip_if": {"chest": 1}, "skip_if_nearby": "chest"},
+        {"tool": "place_block", "args": {"block_name": "chest"},
+         "type": "place", "skip_if_nearby": "chest"},
     ],
 
     "build_shelter": [

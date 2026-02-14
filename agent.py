@@ -23,6 +23,7 @@ import requests
 from typing import Optional
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
 from langchain.agents import create_tool_calling_agent, AgentExecutor
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage, AIMessage
@@ -45,6 +46,7 @@ load_dotenv()
 LOCAL_LLM_BASE_URL = os.getenv("LOCAL_LLM_BASE_URL", "http://192.168.86.250:12000")
 LOCAL_LLM_API_KEY = os.getenv("LOCAL_LLM_API_KEY", "your-jwt-token")
 LOCAL_LLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "qwen3:30b-a3b")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 BOT_API = os.getenv("BOT_API_URL", "http://localhost:3001")
 TICK_INTERVAL = float(os.getenv("TICK_INTERVAL", "3"))  # faster now — chains are quick
 MAX_ITERATIONS = int(os.getenv("MAX_ITERATIONS", "5"))
@@ -97,10 +99,10 @@ def get_grand_goal_status() -> str:
 @lc_tool
 def choose_next_chain(chain_name: str) -> str:
     """Start an action chain. The chain will execute automatically without LLM.
-    Available chains: get_wood, make_crafting_table, make_wooden_pickaxe,
+    Available chains: get_wood, mine_stone, make_crafting_table, make_wooden_pickaxe,
     make_stone_pickaxe, make_iron_pickaxe, make_iron_sword, make_iron_armor,
     make_shield, make_bucket, mine_diamonds, make_diamond_pickaxe,
-    make_diamond_sword, find_food, build_shelter"""
+    make_diamond_sword, find_food, build_shelter, place_furnace, place_chest"""
     result = chain_executor.start_chain(chain_name)
     return result
 
@@ -129,14 +131,21 @@ WHEN YOU'RE CALLED:
 IMPORTANT RULES:
 - ALWAYS call choose_next_chain() with one of the available chains
 - Match the chain to the current grand goal's next available task
-- If a chain failed, try a DIFFERENT chain or gather prerequisites first
+- The chain name should match the task's chain_name in the goal progress
+- If a chain failed, ANALYZE why it failed and try a DIFFERENT approach:
+  1. Was the resource not found? → explore to a new area first, then retry
+  2. Missing tool? → craft the tool chain first (e.g., make_stone_pickaxe before mining iron)
+  3. Same chain failed multiple times? → try different prerequisite chains
+  4. If you're truly stuck, try a completely different chain that achieves a different task
 - Keep responses SHORT — you're a planner, not a narrator
 
 AVAILABLE CHAINS:
-  Basic: get_wood, make_crafting_table, make_wooden_pickaxe, make_stone_pickaxe
+  Gathering: get_wood, mine_stone
+  Basic Tools: make_crafting_table, make_wooden_pickaxe, make_stone_pickaxe
   Iron: make_iron_pickaxe, make_iron_sword, make_iron_armor, make_shield, make_bucket
   Diamond: mine_diamonds, make_diamond_pickaxe, make_diamond_sword
-  Survival: find_food, build_shelter
+  Building: build_shelter, place_furnace, place_chest
+  Survival: find_food
 
 CRAFTING ORDER: wood → crafting_table → wooden_pickaxe → stone_pickaxe → iron_pickaxe → diamond_pickaxe
 Each requires the previous. Don't skip steps."""
@@ -193,6 +202,20 @@ def call_llm_planner(reason: str, context: str = "") -> str:
 
     if context:
         parts.append(f"\nDETAILS: {context}")
+
+    # Current bot state (HP, food, position, time)
+    try:
+        state_r = requests.get(f"{BOT_API}/state", timeout=5).json()
+        pos = state_r.get("position", {})
+        hp = state_r.get("health", "?")
+        food = state_r.get("food", "?")
+        time_of_day = state_r.get("timeOfDay", 0)
+        day_phase = "night" if 13000 <= time_of_day <= 23000 else "day"
+        parts.append(f"\nBOT STATE: HP={hp}/20, Food={food}/20, "
+                     f"Pos=({pos.get('x','?'):.0f}, {pos.get('y','?'):.0f}, {pos.get('z','?'):.0f}), "
+                     f"Time={day_phase} ({time_of_day})")
+    except:
+        pass
 
     # Current inventory summary
     try:
@@ -272,6 +295,149 @@ def call_llm_planner(reason: str, context: str = "") -> str:
     except Exception as e:
         print(f"   ❌ LLM error: {e}")
         return f"LLM error: {e}"
+
+
+# ============================================
+# CLAUDE CHAT AGENT (player conversations)
+# ============================================
+
+CHAT_SYSTEM_PROMPT = """You are PenguinBot, a friendly Minecraft AI bot. A player is talking to you in-game.
+
+YOUR PERSONALITY:
+- Friendly, helpful, and concise
+- You speak naturally in the same language the player uses
+- You know what you're currently doing and can explain it
+
+YOUR CAPABILITIES:
+- You can respond to the player via send_chat()
+- You can change what you're doing based on player requests:
+  - set_grand_goal() to switch objectives
+  - choose_next_chain() to start a specific action
+  - skip_grand_task() to skip tasks
+  - complete_grand_task() to mark tasks done
+- You see your current state, inventory, and goal progress
+
+RULES:
+- ALWAYS call send_chat() to respond to the player
+- Keep chat messages SHORT (under 100 chars, Minecraft chat is small)
+- If the player asks you to do something specific, change your goal/chain accordingly
+- If the player is just chatting, respond friendly and continue what you were doing
+- You can send multiple chat messages if needed (split long responses)"""
+
+# Claude chat tools: chat + goal/chain management
+CHAT_TOOLS = [
+    set_grand_goal, complete_grand_task, skip_grand_task,
+    get_grand_goal_status, choose_next_chain,
+]
+# Add send_chat from ALL_TOOLS
+for t in ALL_TOOLS:
+    if hasattr(t, 'name') and t.name == 'send_chat':
+        CHAT_TOOLS.append(t)
+        break
+
+claude_chat_agent = None
+claude_chat_history: list = []
+
+def _get_claude_chat_agent() -> Optional[AgentExecutor]:
+    """Lazy-init Claude chat agent (only when needed)."""
+    global claude_chat_agent
+    if claude_chat_agent is not None:
+        return claude_chat_agent
+    if not ANTHROPIC_API_KEY:
+        print("   ⚠️ ANTHROPIC_API_KEY not set, falling back to local LLM for chat")
+        return None
+    try:
+        claude_llm = ChatAnthropic(
+            model="claude-sonnet-4-20250514",
+            api_key=ANTHROPIC_API_KEY,
+            temperature=0.5,
+            max_tokens=300,
+        )
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", CHAT_SYSTEM_PROMPT),
+            MessagesPlaceholder(variable_name="chat_history"),
+            ("human", "{input}"),
+            MessagesPlaceholder(variable_name="agent_scratchpad"),
+        ])
+        agent = create_tool_calling_agent(claude_llm, CHAT_TOOLS, prompt)
+        claude_chat_agent = AgentExecutor(
+            agent=agent,
+            tools=CHAT_TOOLS,
+            verbose=True,
+            max_iterations=3,
+            handle_parsing_errors=True,
+            return_intermediate_steps=True,
+        )
+        print("   🤖 Claude chat agent initialized")
+        return claude_chat_agent
+    except Exception as e:
+        print(f"   ❌ Claude init failed: {e}, falling back to local LLM")
+        return None
+
+
+def call_claude_chat(player_message: str) -> str:
+    """Handle player chat with Claude API. Falls back to local LLM if unavailable."""
+    global claude_chat_history
+
+    agent = _get_claude_chat_agent()
+    if not agent:
+        # Fallback to local LLM
+        return call_llm_planner("Player message",
+                                f"CHAT: {player_message}\nRespond with send_chat then resume task.")
+
+    # Build context
+    parts = [f"PLAYER MESSAGE: {player_message}"]
+
+    goal_ctx = goal_manager.get_prompt_context()
+    parts.append(f"\n{goal_ctx}")
+
+    chain_status = chain_executor.get_status_str()
+    parts.append(f"\nCURRENT ACTION: {chain_status}")
+
+    try:
+        state_r = requests.get(f"{BOT_API}/state", timeout=5).json()
+        pos = state_r.get("position", {})
+        hp = state_r.get("health", "?")
+        food = state_r.get("food", "?")
+        parts.append(f"\nBOT STATE: HP={hp}/20, Food={food}/20, "
+                     f"Pos=({pos.get('x','?'):.0f}, {pos.get('y','?'):.0f}, {pos.get('z','?'):.0f})")
+    except:
+        pass
+
+    try:
+        r = requests.get(f"{BOT_API}/inventory", timeout=5)
+        items = r.json().get("items", [])
+        inv_str = ", ".join(f"{i['name']}x{i['count']}" for i in items[:15]) or "empty"
+        parts.append(f"\nINVENTORY: {inv_str}")
+    except:
+        pass
+
+    input_msg = "\n".join(parts)
+    print(f"\n💬 CLAUDE CHAT: {player_message}")
+
+    try:
+        tick_start = time.time()
+        result = agent.invoke({
+            "input": input_msg,
+            "chat_history": claude_chat_history[-6:],  # last 3 turns
+        })
+        elapsed = time.time() - tick_start
+
+        output = result.get("output", "No output")
+        print(f"   💬 Claude ({elapsed:.1f}s): {output[:200]}")
+
+        # Update chat history
+        claude_chat_history.append(HumanMessage(content=input_msg[:500]))
+        claude_chat_history.append(AIMessage(content=output[:500]))
+        if len(claude_chat_history) > 12:
+            claude_chat_history = claude_chat_history[-12:]
+
+        return output
+    except Exception as e:
+        print(f"   ❌ Claude error: {e}")
+        # Fallback to local LLM
+        return call_llm_planner("Player message",
+                                f"CHAT: {player_message}\nRespond with send_chat then resume task.")
 
 
 # ============================================
@@ -369,10 +535,10 @@ def tick_once(tick_num: int):
     if check_death():
         return
 
-    # ── Player chat ──
+    # ── Player chat → Claude API ──
     player_chat = check_player_chat()
     if player_chat:
-        call_llm_planner("Player message", f"CHAT: {player_chat}\nRespond with send_chat then resume task.")
+        call_claude_chat(player_chat)
         return
 
     # ── Layer 1: Chain execution ──
@@ -411,13 +577,17 @@ def tick_once(tick_num: int):
             # Check for infinite loop: same chain repeated without progress
             fail_count = goal_manager.task_fail_count.get(task.id, 0)
             if fail_count >= 5:
-                # Stuck on this task — skip it and let LLM handle
-                print(f"   ⚠️ Task '{task.id}' stuck ({fail_count} attempts). Skipping.")
+                # Stuck on this task — skip for now (will retry later)
+                print(f"   ⚠️ Task '{task.id}' stuck ({fail_count} attempts). Skipping for now.")
                 goal_manager.skip_task(task.id)
                 call_llm_planner(
-                    "Task stuck in loop",
-                    f"Task '{task.id}' completed its chain {fail_count} times but never met "
-                    f"completion requirements ({task.completion_items}). Skipped it. Pick next task."
+                    "Task stuck — skipped for now",
+                    f"Task '{task.id}' (chain: {chain_name}) failed {fail_count} times.\n"
+                    f"Completion needs: {task.completion_items or task.completion_blocks_placed}\n"
+                    f"This task will be RETRIED after other tasks complete.\n"
+                    f"For now, pick a DIFFERENT available task. If the failed task needed resources "
+                    f"(like iron_ore, coal), consider doing a different chain first to change location "
+                    f"or gather prerequisites. Use get_grand_goal_status() to see what's available."
                 )
                 return
             # Track that we're starting this chain again
@@ -461,14 +631,16 @@ def tick_once(tick_num: int):
 def run():
     print("=" * 60)
     print("🤖 Minecraft AI Agent v6 — Chain of Action")
-    print(f"🧠 LLM: {LOCAL_LLM_MODEL} (called only for planning)")
+    print(f"🧠 Planning: {LOCAL_LLM_MODEL} (action chains)")
+    print(f"💬 Chat: {'Claude API' if ANTHROPIC_API_KEY else 'Local LLM (no ANTHROPIC_API_KEY)'}")
     print(f"⏱️  Tick: {TICK_INTERVAL}s")
     print(f"📋 Goal: {goal_manager.active_goal.description if goal_manager.active_goal else 'None'}")
     print("=" * 60)
     print()
     print("Layer 0: Instinct (eat, flee, shelter) → no LLM, instant")
     print("Layer 1: Chain execution (mine, craft, smelt) → no LLM, fast")
-    print("Layer 2: Planning (what to do next) → LLM call, slow")
+    print("Layer 2: Planning (what to do next) → Local LLM")
+    print("Layer 2: Player chat → Claude API")
     print()
 
     tick = 0
