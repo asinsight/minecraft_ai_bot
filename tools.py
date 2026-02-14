@@ -200,7 +200,7 @@ def move_to(x: float, y: float, z: float) -> str:
         z: Z coordinate
     """
     try:
-        r = requests.post(f"{BOT_API}/action/move", json={"x": x, "y": y, "z": z}, timeout=30)
+        r = requests.post(f"{BOT_API}/action/move", json={"x": x, "y": y, "z": z}, timeout=130)
         return r.json().get("message", "No result")
     except Exception as e:
         return f"Error: {e}"

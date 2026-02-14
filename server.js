@@ -395,12 +395,34 @@ app.post('/action/move', async (req, res) => {
   if (!botReady) return res.status(503).json({ error: 'Bot not ready' })
   try {
     const { x, y, z, range } = req.body
-    const timeout = setTimeout(() => {
+    const dist = bot.entity.position.distanceTo(new Vec3(x, y, z))
+    // Dynamic timeout: 2 seconds per block, min 15s, max 120s
+    const timeoutMs = Math.max(15000, Math.min(120000, dist * 2000))
+
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
       bot.pathfinder.setGoal(null)
-    }, 30000)
-    await bot.pathfinder.goto(new goals.GoalNear(x, y, z, range || 2))
-    clearTimeout(timeout)
-    res.json({ success: true, message: `Moved to ${x}, ${y}, ${z}` })
+    }, timeoutMs)
+
+    try {
+      await bot.pathfinder.goto(new goals.GoalNear(x, y, z, range || 2))
+      clearTimeout(timer)
+      if (timedOut) {
+        const finalDist = bot.entity.position.distanceTo(new Vec3(x, y, z)).toFixed(1)
+        res.json({ success: false, message: `Movement timed out after ${Math.round(timeoutMs/1000)}s. Got within ${finalDist} blocks of target. Path may be blocked.` })
+      } else {
+        res.json({ success: true, message: `Moved to ${x}, ${y}, ${z}` })
+      }
+    } catch (pathErr) {
+      clearTimeout(timer)
+      const finalDist = bot.entity.position.distanceTo(new Vec3(x, y, z)).toFixed(1)
+      if (timedOut) {
+        res.json({ success: false, message: `Movement timed out. Got within ${finalDist} blocks. Path may be blocked — try a closer target or dig through obstacles.` })
+      } else {
+        res.json({ success: false, message: `Pathfinding failed (${finalDist} blocks away): ${pathErr.message}. Try moving to a closer point first.` })
+      }
+    }
   } catch (err) {
     res.json({ success: false, message: err.message })
   }
@@ -1294,103 +1316,190 @@ app.post('/action/build_shelter', async (req, res) => {
     const buildBlocks = ['cobblestone', 'dirt', 'oak_planks', 'spruce_planks', 'birch_planks',
       'stone', 'deepslate', 'sandstone', 'oak_log', 'spruce_log', 'birch_log', 'andesite', 'diorite', 'granite']
 
-    let material = null
+    let materialName = null
     for (const name of buildBlocks) {
       const item = bot.inventory.items().find(i => i.name === name)
       if (item && item.count >= 20) {
-        material = item
+        materialName = name
         break
       }
     }
 
-    if (!material) {
-      const inv = bot.inventory.items().map(i => `${i.name} x${i.count}`).join(', ') || 'empty'
-      return res.json({
-        success: false,
-        message: `Need at least 20 building blocks (cobblestone, dirt, planks, etc). Inventory: ${inv}`
-      })
+    if (!materialName) {
+      // Also check combined total across multiple block types
+      let total = 0
+      for (const name of buildBlocks) {
+        const item = bot.inventory.items().find(i => i.name === name)
+        if (item) total += item.count
+      }
+      if (total < 20) {
+        return res.json({
+          success: false,
+          message: `Need at least 20 building blocks. Have ${total} total. Mine cobblestone (stone) to get more.`
+        })
+      }
+      // Use whatever we have most of
+      materialName = buildBlocks.reduce((best, name) => {
+        const item = bot.inventory.items().find(i => i.name === name)
+        const count = item ? item.count : 0
+        const bestItem = bot.inventory.items().find(i => i.name === best)
+        const bestCount = bestItem ? bestItem.count : 0
+        return count > bestCount ? name : best
+      }, buildBlocks[0])
     }
 
     const pos = bot.entity.position.floored()
-    const baseX = pos.x
-    const baseY = pos.y
-    const baseZ = pos.z
+    const bx = pos.x
+    const by = pos.y
+    const bz = pos.z
     let placed = 0
+    let failed = 0
 
-    // Helper: place a single block at x,y,z
+    // Helper: equip any building material (may switch types if one runs out)
+    async function equipMaterial() {
+      // First try primary material
+      let item = bot.inventory.items().find(i => i.name === materialName)
+      if (item) {
+        await bot.equip(item, 'hand')
+        return true
+      }
+      // Fallback to any building block
+      for (const name of buildBlocks) {
+        item = bot.inventory.items().find(i => i.name === name)
+        if (item) {
+          await bot.equip(item, 'hand')
+          return true
+        }
+      }
+      return false
+    }
+
+    // Helper: place a block, moving closer if needed
     async function placeAt(x, y, z) {
       try {
-        // Check if there's already a solid block there
-        const existing = bot.blockAt(new Vec3(x, y, z))
-        if (existing && existing.name !== 'air') return false
+        const target = new Vec3(x, y, z)
+        const existing = bot.blockAt(target)
+        if (existing && existing.name !== 'air' && existing.name !== 'cave_air') return true // already filled
 
-        // Need a reference block adjacent to the target position
-        const directions = [
-          [0, -1, 0], [0, 1, 0],
-          [1, 0, 0], [-1, 0, 0],
-          [0, 0, 1], [0, 0, -1]
-        ]
+        // Move closer if too far (need to be within ~4.5 blocks to place)
+        const dist = bot.entity.position.distanceTo(target)
+        if (dist > 4) {
+          try {
+            await bot.pathfinder.goto(new goals.GoalNear(x, y, z, 3))
+          } catch (e) { /* best effort */ }
+        }
 
-        for (const [dx, dy, dz] of directions) {
-          const refPos = new Vec3(x + dx, y + dy, z + dz)
-          const refBlock = bot.blockAt(refPos)
-          if (refBlock && refBlock.name !== 'air' && refBlock.boundingBox === 'block') {
-            // Equip building material
-            const item = bot.inventory.items().find(i => i.name === material.name)
-            if (!item) return false
+        // Find adjacent reference block
+        const dirs = [[0,-1,0],[0,1,0],[1,0,0],[-1,0,0],[0,0,1],[0,0,-1]]
+        for (const [dx, dy, dz] of dirs) {
+          const refBlock = bot.blockAt(new Vec3(x+dx, y+dy, z+dz))
+          if (refBlock && refBlock.name !== 'air' && refBlock.name !== 'cave_air' && refBlock.boundingBox === 'block') {
+            if (!(await equipMaterial())) return false // no blocks left
 
-            await bot.equip(item, 'hand')
-            const faceVector = new Vec3(-dx, -dy, -dz)
-            await bot.placeBlock(refBlock, faceVector)
+            const faceVec = new Vec3(-dx, -dy, -dz)
+            await bot.placeBlock(refBlock, faceVec)
             placed++
+            await new Promise(r => setTimeout(r, 100)) // small delay for server
             return true
           }
         }
+        failed++
         return false
       } catch (e) {
+        failed++
         return false
       }
     }
-
-    // Build a 5x3x5 shelter (walls + roof, hollow inside)
-    // Bot stands at center, so shelter goes from -2 to +2 on X/Z, 0 to 3 on Y
-    const size = 2  // half-width
 
     bot.chat('Building shelter...')
 
-    // Walls (4 sides, 3 blocks high)
-    for (let y = 0; y < 3; y++) {
-      for (let d = -size; d <= size; d++) {
-        // North wall (z = -size)
-        await placeAt(baseX + d, baseY + y, baseZ - size)
-        // South wall (z = +size)
-        await placeAt(baseX + d, baseY + y, baseZ + size)
-        // West wall (x = -size)
-        await placeAt(baseX - size, baseY + y, baseZ + d)
-        // East wall (x = +size)
-        await placeAt(baseX + size, baseY + y, baseZ + d)
+    // SHELTER DESIGN: 5x3x5 (x: -2..+2, y: 0..2 walls + 3 roof, z: -2..+2)
+    //
+    //   Roof (y=3):       Walls (y=0,1,2):       Floor plan:
+    //   # # # # #         # # # # #              # # # # #
+    //   # # # # #         # . . . #              # . . . #
+    //   # # # # #         # . . . #              # . D . #   D = door (north)
+    //   # # # # #         # . . . #              # . . . #
+    //   # # # # #         # # # # #              # # # # #
+
+    const S = 2 // half-size
+
+    // STEP 1: Place a ground block under the bot if standing on something soft/air
+    const groundBlock = bot.blockAt(pos.offset(0, -1, 0))
+    if (!groundBlock || groundBlock.name === 'air') {
+      // Place ground first so we have a reference
+      try {
+        if (await equipMaterial()) {
+          // try to place on something nearby below
+          for (let dx = -1; dx <= 1; dx++) {
+            for (let dz = -1; dz <= 1; dz++) {
+              const below = bot.blockAt(pos.offset(dx, -2, dz))
+              if (below && below.name !== 'air' && below.boundingBox === 'block') {
+                await bot.placeBlock(below, new Vec3(0, 1, 0))
+                placed++
+                break
+              }
+            }
+          }
+        }
+      } catch (e) {}
+    }
+
+    // STEP 2: Walls — layer by layer, bottom to top
+    // This ensures each layer has reference blocks from the layer below
+    for (let y = 0; y <= 2; y++) {
+      // North wall (z = -S)
+      for (let x = -S; x <= S; x++) {
+        await placeAt(bx + x, by + y, bz - S)
+      }
+      // South wall (z = +S)
+      for (let x = -S; x <= S; x++) {
+        await placeAt(bx + x, by + y, bz + S)
+      }
+      // West wall (x = -S), excluding corners (already placed)
+      for (let z = -S + 1; z <= S - 1; z++) {
+        await placeAt(bx - S, by + y, bz + z)
+      }
+      // East wall (x = +S), excluding corners
+      for (let z = -S + 1; z <= S - 1; z++) {
+        await placeAt(bx + S, by + y, bz + z)
       }
     }
 
-    // Roof (top layer)
-    for (let x = -size; x <= size; x++) {
-      for (let z = -size; z <= size; z++) {
-        await placeAt(baseX + x, baseY + 3, baseZ + z)
+    // STEP 3: Roof — from edges inward (spiral) so each block has an adjacent reference
+    // First the border (directly on top of walls at y=3)
+    for (let x = -S; x <= S; x++) {
+      await placeAt(bx + x, by + 3, bz - S)
+      await placeAt(bx + x, by + 3, bz + S)
+    }
+    for (let z = -S + 1; z <= S - 1; z++) {
+      await placeAt(bx - S, by + 3, bz + z)
+      await placeAt(bx + S, by + 3, bz + z)
+    }
+    // Then the inner roof (these have the border as reference)
+    for (let x = -S + 1; x <= S - 1; x++) {
+      for (let z = -S + 1; z <= S - 1; z++) {
+        await placeAt(bx + x, by + 3, bz + z)
       }
     }
 
-    // Leave a door (break 2 blocks on one side)
+    // STEP 4: Door — break 2 blocks on the north wall for entry
     try {
-      const door1 = bot.blockAt(new Vec3(baseX, baseY, baseZ - size))
-      const door2 = bot.blockAt(new Vec3(baseX, baseY + 1, baseZ - size))
+      const door1 = bot.blockAt(new Vec3(bx, by, bz - S))
+      const door2 = bot.blockAt(new Vec3(bx, by + 1, bz - S))
       if (door1 && door1.name !== 'air') await bot.dig(door1)
       if (door2 && door2.name !== 'air') await bot.dig(door2)
-    } catch (e) { /* door creation optional */ }
+    } catch (e) {}
 
-    bot.chat(`Shelter built! Used ${placed} ${material.name} blocks.`)
+    // Move back inside
+    try {
+      await bot.pathfinder.goto(new goals.GoalNear(bx, by, bz, 0))
+    } catch (e) {}
+
+    bot.chat(`Shelter built! ${placed} blocks placed.`)
     res.json({
       success: true,
-      message: `Built shelter with ${placed} ${material.name} blocks at (${baseX}, ${baseY}, ${baseZ}). Door on north side.`
+      message: `Built 5x3x5 shelter with ${placed} blocks (${materialName}) at (${bx}, ${by}, ${bz}). Roof complete. Door on north side.${failed > 0 ? ` (${failed} blocks couldn't be placed)` : ''}`
     })
   } catch (err) {
     res.json({ success: false, message: err.message })
