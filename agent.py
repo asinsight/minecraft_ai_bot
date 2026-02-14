@@ -78,8 +78,19 @@ SURVIVAL OVERRIDES (highest priority):
 ═══════════════════════════════════════
 - Health < 5: IMMEDIATELY eat food or flee. Don't continue the goal.
 - Hunger < 5: Find and eat food before continuing.
-- Night + hostile mobs nearby: Fight or find shelter.
 - Player request in chat: Help the player (but can resume goal after).
+
+DAY/NIGHT CYCLE STRATEGY:
+- DAYTIME (dawn/morning/afternoon): Surface tasks — gather wood, hunt, explore, build.
+- DUSK: Night is coming in ~2 minutes! Head to shelter or dig underground NOW.
+- NIGHT/MIDNIGHT: DO NOT stay on the surface! Phantoms and hostile mobs WILL kill you.
+  → If on surface: dig_down or dig_shelter immediately.
+  → If underground (y < 55): You're safe! Use night to mine ores, dig tunnels, smelt items.
+  → Night is NOT wasted time — it's the best time for mining operations.
+- DAWN: Sun is rising, safe to return to surface for daytime tasks.
+
+UNDERGROUND = SAFE: Below y=55, no phantoms or surface mobs spawn.
+  Use this: dig_down to ore level → dig_tunnel for strip mining → smelt at furnace.
 
 ═══════════════════════════════════════
 GRAND GOAL (BIG PICTURE):
@@ -166,6 +177,10 @@ def check_survival_override() -> Optional[str]:
         state = r.json()
         health = state.get("health", 20)
         food = state.get("food", 20)
+        time_phase = state.get("time", "day")
+        is_safe_outside = state.get("isSafeOutside", True)
+        is_underground = state.get("isUnderground", False)
+        pos_y = float(state.get("position", {}).get("y", 64))
 
         if health < 5:
             return "⚠️ CRITICAL: Health is very low! Eat food immediately or flee from danger."
@@ -188,6 +203,34 @@ def check_survival_override() -> Optional[str]:
             return (
                 f"⚠️ AVOID COMBAT: {threat['reason']}\n"
                 f"Don't engage enemies. Move away carefully or gear up first."
+            )
+
+        # Night strategy: go underground if on surface
+        if not is_safe_outside and not is_underground:
+            return (
+                f"🌙 NIGHT TIME ({time_phase})! You are on the SURFACE (y={pos_y:.0f}) — this is DANGEROUS.\n"
+                f"Phantoms, zombies, skeletons, and creepers spawn on the surface at night.\n"
+                f"DO NOT stay on the surface. Choose one:\n"
+                f"  1. Go to saved shelter: find_nearest_location('shelter') → move_to\n"
+                f"  2. Dig underground NOW: dig_down(depth=10) or dig_shelter\n"
+                f"  3. If already mining underground, continue — you're safe below y=55\n"
+                f"Night is PRODUCTIVE time — mine ores, dig tunnels, smelt items underground!\n"
+                f"Only return to surface after dawn (time becomes 'morning' or 'dawn')."
+            )
+
+        # Dusk warning
+        if time_phase == "dusk" and not is_underground:
+            return (
+                f"🌅 DUSK — Night is approaching! You have ~2 minutes before mobs spawn.\n"
+                f"Prepare now: either head to shelter or dig underground.\n"
+                f"If you plan to mine, use dig_down now — you'll be safe AND productive underground."
+            )
+
+        # Dawn notification — if underground, suggest going up
+        if time_phase == "dawn" and is_underground:
+            return (
+                f"🌄 DAWN — The sun is rising! It's safe to return to the surface now.\n"
+                f"Finish what you're doing underground, then head up for surface tasks."
             )
 
         return None

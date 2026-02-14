@@ -37,10 +37,25 @@ def get_world_state() -> str:
         chat = data.get("recentChat", [])
         chat_str = " | ".join(f"{c['username']}: {c['message']}" for c in chat[-5:]) if chat else "no recent chat"
 
+        # Environment info
+        env = data.get('environment', 'surface')
+        env_icons = {
+            'surface': '🌍 Surface',
+            'indoors': '🏠 Indoors',
+            'underground': '⛏️ Underground (cave/mine)',
+            'deep_underground': '🕳️ Deep Underground (deepslate)',
+        }
+        env_str = env_icons.get(env, env)
+        if data.get('isDark'):
+            env_str += ' ⚠️ DARK (mobs can spawn!)'
+        if not data.get('canSeeSky') and data.get('roofHeight'):
+            env_str += f' (roof {data["roofHeight"]} blocks up)'
+
         return (
             f"Position: x={pos.get('x')}, y={pos.get('y')}, z={pos.get('z')}\n"
             f"Health: {data.get('health', '?')}/20, Hunger: {data.get('food', '?')}/20\n"
             f"Time: {data.get('time', '?')} (tick {data.get('timeOfDay', '?')})\n"
+            f"Environment: {env_str}\n"
             f"Weather: {'raining' if data.get('isRaining') else 'clear'}\n"
             f"Inventory: {inv}\n"
             f"Nearby blocks: {blocks}\n"

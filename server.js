@@ -63,12 +63,61 @@ app.get('/state', (req, res) => {
     count: item.count
   }))
 
+  // Time phases: 0-1000 sunrise, 1000-6000 morning, 6000-12000 afternoon,
+  // 12000-13000 dusk, 13000-18000 night, 18000-23000 midnight, 23000-24000 dawn
+  const t = bot.time.timeOfDay
+  let timePhase = 'day'
+  if (t >= 23000 || t < 1000) timePhase = 'dawn'
+  else if (t < 6000) timePhase = 'morning'
+  else if (t < 11000) timePhase = 'afternoon'
+  else if (t < 13000) timePhase = 'dusk'
+  else if (t < 18000) timePhase = 'night'
+  else timePhase = 'midnight'
+
+  // ── Environment detection ──
+  const headPos = pos.offset(0, 1, 0)
+  const blockLight = bot.blockAt(headPos)?.light ?? 0
+  const skyLightVal = bot.blockAt(headPos)?.skyLight ?? 0
+
+  // Check sky visibility: scan upward for solid blocks
+  let canSeeSky = true
+  let roofHeight = 0
+  for (let dy = 2; dy <= 64 && pos.y + dy <= 320; dy++) {
+    const above = bot.blockAt(pos.offset(0, dy, 0))
+    if (above && above.name !== 'air' && above.name !== 'cave_air'
+        && above.name !== 'void_air' && !above.name.includes('leaves')
+        && !above.name.includes('glass')) {
+      canSeeSky = false
+      roofHeight = dy
+      break
+    }
+  }
+
+  // Determine environment type
+  const y = Math.floor(pos.y)
+  let environment = 'surface'
+  if (!canSeeSky && y < 0) {
+    environment = 'deep_underground'  // deepslate layer
+  } else if (!canSeeSky && y < 50) {
+    environment = 'underground'  // cave or mine
+  } else if (!canSeeSky && y >= 50) {
+    environment = 'indoors'  // under a roof but near surface level
+  }
+
+  const isDark = blockLight < 8
+
   res.json({
     position: { x: pos.x.toFixed(1), y: pos.y.toFixed(1), z: pos.z.toFixed(1) },
     health: bot.health,
     food: bot.food,
-    time: bot.time.timeOfDay > 13000 ? 'night' : 'day',
-    timeOfDay: bot.time.timeOfDay,
+    time: timePhase,
+    timeOfDay: t,
+    isSafeOutside: t < 12000 || t >= 23000,
+    environment,
+    canSeeSky,
+    lightLevel: blockLight,
+    isDark,
+    roofHeight: canSeeSky ? null : roofHeight,
     isRaining: bot.isRaining,
     inventory,
     nearbyBlocks: blockNames,
