@@ -16,6 +16,7 @@ Powered by LangChain Agent + Local LLM (GLM-4.7-Flash). Zero API cost for autono
 │    [Node.js] Mineflayer + Express REST API        │
 │    server.js                                      │
 │    - Bot connection, world interaction             │
+│    - Environment detection (surface/cave/indoor)   │
 │    - Smart combat (heal, flee, auto-equip)         │
 │    - Threat assessment engine                      │
 │    - Furnace smelting (auto-craft furnace if needed)│
@@ -134,6 +135,38 @@ The LLM might decide:
 └─ 6. LLM Decides ──────── picks tools, executes, advances progress
 ```
 
+### Environment Awareness
+
+The bot knows where it is — not just coordinates, but what kind of space it's in:
+
+```
+Invoking: `get_world_state`
+
+  Position: x=80.5, y=32.0, z=-60.3
+  Health: 18/20, Hunger: 16/20
+  Time: night (tick 15200)
+  Environment: ⛏️ Underground (cave/mine) ⚠️ DARK (mobs can spawn!) (roof 18 blocks up)
+  Weather: clear
+  Inventory: stone_pickaxe x1, raw_iron x2, torch x8
+  Nearby blocks: stone, deepslate, iron_ore, coal_ore
+  Nearby entities: zombie(12m), bat(6m)
+```
+
+Environment is detected by scanning upward from the bot's head for solid blocks:
+
+| Environment | Detection | Icon |
+|-------------|-----------|------|
+| Surface | Sky visible (no solid blocks above within 64 blocks) | 🌍 |
+| Indoors | Sky blocked + y ≥ 50 (under a roof, near surface) | 🏠 |
+| Underground | Sky blocked + y < 50 (cave, mine, or tunnel) | ⛏️ |
+| Deep Underground | Sky blocked + y < 0 (deepslate layer) | 🕳️ |
+| Dark warning | Light level < 8 (hostile mobs can spawn here) | ⚠️ |
+
+This lets the LLM make contextual decisions:
+- "I'm underground and it's dark → place torches"
+- "I'm in a cave with a zombie nearby → fight or flee?"
+- "I'm indoors in my shelter → safe, can craft"
+
 ### Death → Reassess → Adapt
 
 When the bot dies, it doesn't just resume what it was doing:
@@ -197,7 +230,7 @@ GET /threat_assessment
 
 ### Smelting & Iron Age
 
-The bot can now smelt ores in a furnace — essential for any iron, gold, or cooked food:
+The bot can smelt ores in a furnace — essential for iron, gold, and cooked food:
 
 ```
 smelt_item("raw_iron", 3)
@@ -303,7 +336,7 @@ Grand goal phase/task completion is saved after every state change. On restart, 
 ### Perception (7)
 | Tool | Description |
 |------|-------------|
-| `get_world_state` | Full snapshot: position, health, inventory, entities, chat, time |
+| `get_world_state` | Full snapshot: position, health, inventory, entities, time, **environment** (surface/cave/indoor + light + dark warning) |
 | `get_inventory` | Detailed inventory contents |
 | `get_nearby` | Block counts and entity list within range |
 | `find_block` | Find nearest block of a specific type |
@@ -513,9 +546,9 @@ python agent.py
 minecraft-bot/
 │
 ├── server.js              # [Node.js] Mineflayer + Express REST API
-│                            Smart combat, threat assessment, death tracking,
-│                            smelting, shelter (build + dig), directional mining,
-│                            item search, all action endpoints
+│                            Environment detection, smart combat, threat assessment,
+│                            death tracking, smelting, shelter (build + dig),
+│                            directional mining, item search
 │
 ├── agent.py               # [Python] Main agent loop
 │                            Tick loop, survival override, death reassessment,
@@ -552,50 +585,49 @@ minecraft-bot/
 ══════════════════════════════════════════
 🔄 Tick #42
 🏆 Defeat the Ender Dragon [Tasks 8/25 (32%)]
-🎯 Active: make_iron_pickaxe [Step 7/10]
+🎯 Active: make_iron_pickaxe [Step 5/10]
 ══════════════════════════════════════════
 
-⚔️ Threat: SAFE — No threats nearby.
+Invoking: `get_world_state`
+  Position: x=80.5, y=32.0, z=-60.3
+  Health: 18/20, Hunger: 16/20
+  Time: afternoon
+  Environment: ⛏️ Underground (cave/mine) ⚠️ DARK (roof 18 blocks up)
+  Nearby: stone, iron_ore, coal_ore, zombie(15m)
+
+  "I'm underground near iron. Let me mine it and smelt."
+
+Invoking: `mine_block` with {'block_type': 'iron_ore', 'count': 3}
+  Mined 3 iron_ore → got raw_iron x3
 
 Invoking: `smelt_item` with {'item_name': 'raw_iron', 'count': 3}
   Smelted raw_iron → got iron_ingot x3
 
-Invoking: `complete_step` with {'result': 'Got 3 iron ingots from smelting'}
-  Step 7 done. Next: Step 8 — Craft sticks if needed
-
-Invoking: `craft_item` with {'item_name': 'stick'}
-  Crafted stick x4
-
-Invoking: `skip_step` with {'reason': 'Already have sticks'}
-  Skipped step 8. Next: Step 9 — Craft iron pickaxe
-
 Invoking: `craft_item` with {'item_name': 'iron_pickaxe'}
   Crafted iron_pickaxe
 
-Invoking: `complete_step` with {'result': 'Iron pickaxe crafted!'}
-  Step 9 done. Next: Step 10 — Equip iron pickaxe
-
-✅ Agent: Smelted iron and crafted iron pickaxe. Iron Age reached!
-⏱️  Tick took 12.1s
+✅ Agent: Found iron in cave, smelted, and crafted iron pickaxe!
+⏱️  Tick took 14.2s
 
 ══════════════════════════════════════════
-🔄 Tick #50  (later, night approaches)
+🔄 Tick #55  (night, on surface)
 ══════════════════════════════════════════
 
-⚔️ Threat: AVOID — No weapon against 2 hostiles. Craft a sword first.
+⚔️ Threat: FLEE — Low health (6/20) and no food.
 
 Invoking: `get_world_state`
-  Time: dusk, Health: 20/20
+  Environment: 🌍 Surface ⚠️ DARK (mobs can spawn!)
+  Nearby entities: zombie(8m), skeleton(14m)
   No shelter saved nearby.
 
-  "Night is coming, no shelter nearby, and hostiles spawning.
-   I have no blocks to build. Using dig_shelter!"
+  "Critical! Night, low health, no food, no shelter.
+   Digging emergency shelter NOW."
 
 Invoking: `dig_shelter`
   Dug emergency underground shelter (22 blocks mined).
-  Entrance sealed! You are safe from mobs. | 📍 Saved as 'shelter_2'
+  Entrance sealed! | 📍 Saved as 'shelter'
 
-✅ Agent: Night emergency — dug underground and sealed entrance. Safe!
+✅ Agent: Emergency — dug underground shelter. Safe from mobs.
 ```
 
 ---
@@ -617,6 +649,7 @@ Invoking: `dig_shelter`
 - [x] Grand Goal system with dependency graph (not fixed order)
 - [x] LLM autonomous task selection from available tasks
 - [x] Multi-step Goal Planner (8 predefined task chains)
+- [x] Environment detection (surface / cave / indoor / deep underground + light level)
 - [x] Smart combat AI (heal mid-fight, flee if losing, auto-equip)
 - [x] Threat assessment engine (fight/avoid/flee)
 - [x] Furnace smelting (auto-craft furnace, fuel detection)
@@ -653,4 +686,4 @@ Invoking: `dig_shelter`
 
 **Author**: Jun
 **Created**: 2026-02-13
-**Version**: v3.2 — Smelting, Mining & Emergency Shelter
+**Version**: v3.3 — Environment Awareness
