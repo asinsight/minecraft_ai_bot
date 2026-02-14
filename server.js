@@ -454,9 +454,33 @@ app.post('/action/move', async (req, res) => {
   if (!botReady) return res.status(503).json({ error: 'Bot not ready' })
   try {
     const { x, y, z, range } = req.body
-    const dist = bot.entity.position.distanceTo(new Vec3(x, y, z))
+    const target = new Vec3(x, y, z)
+    const dist = bot.entity.position.distanceTo(target)
     // Dynamic timeout: 2 seconds per block, min 15s, max 120s
     const timeoutMs = Math.max(15000, Math.min(120000, dist * 2000))
+
+    // Helper: try mining the block in front of the bot (toward target) to clear path
+    async function tryMineObstacle() {
+      const pos = bot.entity.position
+      const dir = target.minus(pos)
+      const len = Math.sqrt(dir.x * dir.x + dir.z * dir.z) || 1
+      // Normalized direction (only X/Z, rounded to nearest block)
+      const dx = Math.round(dir.x / len)
+      const dz = Math.round(dir.z / len)
+      // Try mining at eye level and foot level in front of bot
+      for (const dy of [0, 1]) {
+        const blockPos = pos.floored().offset(dx, dy, dz)
+        const block = bot.blockAt(blockPos)
+        if (block && block.name !== 'air' && block.name !== 'cave_air' && block.name !== 'water'
+            && block.boundingBox === 'block' && block.diggable) {
+          try {
+            await bot.dig(block)
+            return true
+          } catch (e) { /* can't dig */ }
+        }
+      }
+      return false
+    }
 
     let timedOut = false
     const timer = setTimeout(() => {
@@ -468,19 +492,41 @@ app.post('/action/move', async (req, res) => {
       await bot.pathfinder.goto(new goals.GoalNear(x, y, z, range || 2))
       clearTimeout(timer)
       if (timedOut) {
-        const finalDist = bot.entity.position.distanceTo(new Vec3(x, y, z)).toFixed(1)
-        res.json({ success: false, message: `Movement timed out after ${Math.round(timeoutMs/1000)}s. Got within ${finalDist} blocks of target. Path may be blocked.` })
+        // First attempt failed — try mining obstacle and retry once
+        const mined = await tryMineObstacle()
+        if (mined) {
+          let retry2TimedOut = false
+          const retryTimer = setTimeout(() => {
+            retry2TimedOut = true
+            bot.pathfinder.setGoal(null)
+          }, Math.min(timeoutMs, 30000))
+          try {
+            await bot.pathfinder.goto(new goals.GoalNear(x, y, z, range || 2))
+            clearTimeout(retryTimer)
+            if (!retry2TimedOut) {
+              return res.json({ success: true, message: `Moved to ${x}, ${y}, ${z} (mined obstacle)` })
+            }
+          } catch (e) { clearTimeout(retryTimer) }
+        }
+        const finalDist = bot.entity.position.distanceTo(target).toFixed(1)
+        res.json({ success: false, message: `Movement blocked. ${finalDist} blocks away from target (${x}, ${y}, ${z}). Mined obstacle: ${mined ? 'yes' : 'no'}.` })
       } else {
         res.json({ success: true, message: `Moved to ${x}, ${y}, ${z}` })
       }
     } catch (pathErr) {
       clearTimeout(timer)
-      const finalDist = bot.entity.position.distanceTo(new Vec3(x, y, z)).toFixed(1)
-      if (timedOut) {
-        res.json({ success: false, message: `Movement timed out. Got within ${finalDist} blocks. Path may be blocked — try a closer target or dig through obstacles.` })
-      } else {
-        res.json({ success: false, message: `Pathfinding failed (${finalDist} blocks away): ${pathErr.message}. Try moving to a closer point first.` })
+      // Try mining obstacle before giving up
+      const mined = await tryMineObstacle()
+      if (mined) {
+        try {
+          const retryTimer = setTimeout(() => { bot.pathfinder.setGoal(null) }, Math.min(timeoutMs, 30000))
+          await bot.pathfinder.goto(new goals.GoalNear(x, y, z, range || 2))
+          clearTimeout(retryTimer)
+          return res.json({ success: true, message: `Moved to ${x}, ${y}, ${z} (mined obstacle)` })
+        } catch (e) { /* still failed */ }
       }
+      const finalDist = bot.entity.position.distanceTo(target).toFixed(1)
+      res.json({ success: false, message: `Movement blocked. ${finalDist} blocks away from target (${x}, ${y}, ${z}). Mined obstacle: ${mined ? 'yes' : 'no'}.` })
     }
   } catch (err) {
     res.json({ success: false, message: err.message })
@@ -671,16 +717,39 @@ app.post('/action/place', async (req, res) => {
       clearTimeout(timeout)
     }
 
-    // Find a block to place against (below the bot)
-    const pos = bot.entity.position
-    const referenceBlock = bot.blockAt(pos.offset(0, -1, 0))
-    if (!referenceBlock || referenceBlock.name === 'air') {
-      return res.json({ success: false, message: 'No solid block below to place against' })
-    }
+    // Find an air block adjacent to the bot (not where the bot stands) and place there
+    const pos = bot.entity.position.floored()
+    const botBlock = pos // bot occupies this block — cannot place here
+
+    // Candidate positions: sides first, then one block in front (based on yaw)
+    const candidates = [
+      pos.offset(1, 0, 0), pos.offset(-1, 0, 0),
+      pos.offset(0, 0, 1), pos.offset(0, 0, -1),
+    ]
 
     await bot.equip(item, 'hand')
-    await bot.placeBlock(referenceBlock, new Vec3(0, 1, 0))
-    res.json({ success: true, message: `Placed ${block_name}` })
+
+    for (const target of candidates) {
+      const targetBlock = bot.blockAt(target)
+      if (!targetBlock || targetBlock.name !== 'air') continue // need an empty space
+
+      // Find a solid reference block adjacent to the target position
+      const dirs = [[0,-1,0],[0,1,0],[1,0,0],[-1,0,0],[0,0,1],[0,0,-1]]
+      for (const [dx, dy, dz] of dirs) {
+        const refPos = target.offset(dx, dy, dz)
+        // Skip if reference is at bot's position (bot entity blocks placement)
+        if (refPos.x === botBlock.x && refPos.y === botBlock.y && refPos.z === botBlock.z) continue
+        const refBlock = bot.blockAt(refPos)
+        if (refBlock && refBlock.name !== 'air' && refBlock.name !== 'cave_air' && refBlock.boundingBox === 'block') {
+          const faceVec = new Vec3(-dx, -dy, -dz)
+          await bot.placeBlock(refBlock, faceVec)
+          await new Promise(r => setTimeout(r, 100))
+          return res.json({ success: true, message: `Placed ${block_name} at ${target.x}, ${target.y}, ${target.z}` })
+        }
+      }
+    }
+
+    return res.json({ success: false, message: 'No suitable position to place block (need adjacent air + solid reference)' })
   } catch (err) {
     res.json({ success: false, message: err.message })
   }
@@ -1020,16 +1089,34 @@ app.post('/action/smelt', async (req, res) => {
           return res.json({ success: false, message: 'No furnace or crafting table nearby. Place a crafting table first, then craft a furnace (8 cobblestone).' })
         }
 
-        // Place the furnace
+        // Place the furnace (same pattern as /action/place)
         const furnaceInv = bot.inventory.items().find(i => i.name === 'furnace')
         if (furnaceInv) {
           const pos = bot.entity.position.floored()
-          const refBlock = bot.blockAt(pos.offset(1, -1, 0))
-          if (refBlock && refBlock.name !== 'air') {
-            await bot.equip(furnaceInv, 'hand')
-            try {
-              await bot.placeBlock(refBlock, new Vec3(0, 1, 0))
-            } catch (e) { /* try alternate placement */ }
+          const candidates = [
+            pos.offset(1, 0, 0), pos.offset(-1, 0, 0),
+            pos.offset(0, 0, 1), pos.offset(0, 0, -1),
+          ]
+          await bot.equip(furnaceInv, 'hand')
+          for (const target of candidates) {
+            const tb = bot.blockAt(target)
+            if (!tb || tb.name !== 'air') continue
+            const dirs = [[0,-1,0],[0,1,0],[1,0,0],[-1,0,0],[0,0,1],[0,0,-1]]
+            let placed = false
+            for (const [dx, dy, dz] of dirs) {
+              const refPos = target.offset(dx, dy, dz)
+              if (refPos.x === pos.x && refPos.y === pos.y && refPos.z === pos.z) continue
+              const refBlock = bot.blockAt(refPos)
+              if (refBlock && refBlock.name !== 'air' && refBlock.name !== 'cave_air' && refBlock.boundingBox === 'block') {
+                try {
+                  await bot.placeBlock(refBlock, new Vec3(-dx, -dy, -dz))
+                  await new Promise(r => setTimeout(r, 100))
+                  placed = true
+                } catch (e) {}
+                break
+              }
+            }
+            if (placed) break
           }
         }
 
@@ -1165,18 +1252,54 @@ app.post('/action/dig_shelter', async (req, res) => {
     // Auto-equip best pickaxe/shovel
     await autoEquipBestTool('stone')
 
-    // Dig a 3x3x3 room below the bot
-    // Step 1: Dig down 1 block (entrance)
+    // Blocks we can use to seal the entrance (defined early so we can check during digging)
+    const sealBlocks = ['dirt', 'cobblestone', 'stone', 'andesite', 'diorite', 'granite',
+      'deepslate', 'oak_planks', 'spruce_planks', 'birch_planks', 'sandstone',
+      'netherrack', 'oak_log', 'spruce_log', 'birch_log', 'sand', 'gravel']
+
+    // Helper: count seal-able blocks in inventory
+    const countSealBlocks = () => bot.inventory.items()
+      .filter(i => sealBlocks.includes(i.name))
+      .reduce((sum, i) => sum + i.count, 0)
+
+    // Step 1: Collect surface blocks for sealing BEFORE digging the room
+    // Surface blocks (dirt, grass, sand) drop items even without tools
+    const surfaceDiggable = ['grass_block', 'dirt', 'sand', 'gravel', 'snow_block', 'clay']
+    for (let dx = -1; dx <= 1 && countSealBlocks() < 2; dx++) {
+      for (let dz = -1; dz <= 1 && countSealBlocks() < 2; dz++) {
+        // Skip the block directly under the bot (we'll dig that as entrance)
+        if (dx === 0 && dz === 0) continue
+        const surface = bot.blockAt(new Vec3(pos.x + dx, pos.y, pos.z + dz))
+        if (surface && surfaceDiggable.includes(surface.name)) {
+          try {
+            await bot.dig(surface)
+            dug++
+          } catch (e) { /* skip */ }
+        }
+        // Also try one block above surface (tall grass etc won't help, but dirt hills will)
+        if (countSealBlocks() < 2) {
+          const above = bot.blockAt(new Vec3(pos.x + dx, pos.y + 1, pos.z + dz))
+          if (above && surfaceDiggable.includes(above.name)) {
+            try {
+              await bot.dig(above)
+              dug++
+            } catch (e) {}
+          }
+        }
+      }
+    }
+
+    // Step 2: Dig entrance (1 block down)
     const entranceBlock = bot.blockAt(pos.offset(0, -1, 0))
     if (entranceBlock && entranceBlock.name !== 'air') {
       await bot.dig(entranceBlock)
       dug++
     }
 
-    // Step 2: Drop down
+    // Step 3: Drop down
     await new Promise(resolve => setTimeout(resolve, 500))
 
-    // Step 3: Dig a 3x3x3 chamber at current level -2
+    // Step 4: Dig a 3x3x3 chamber below
     const roomY = pos.y - 2
     for (let dx = -1; dx <= 1; dx++) {
       for (let dz = -1; dz <= 1; dz++) {
@@ -1193,7 +1316,7 @@ app.post('/action/dig_shelter', async (req, res) => {
       }
     }
 
-    // Step 4: Dig the entrance shaft (2 blocks down from surface)
+    // Step 5: Dig the entrance shaft (2 blocks down from surface)
     for (let dy = -1; dy >= -2; dy--) {
       const shaft = bot.blockAt(new Vec3(pos.x, pos.y + dy, pos.z))
       if (shaft && shaft.name !== 'air' && shaft.boundingBox === 'block') {
@@ -1204,7 +1327,7 @@ app.post('/action/dig_shelter', async (req, res) => {
       }
     }
 
-    // Step 5: Move into the room
+    // Step 6: Move into the room
     try {
       const roomCenter = new Vec3(pos.x, roomY, pos.z)
       await bot.pathfinder.goto(new goals.GoalNear(roomCenter.x, roomCenter.y, roomCenter.z, 0))
@@ -1212,12 +1335,7 @@ app.post('/action/dig_shelter', async (req, res) => {
 
     await new Promise(resolve => setTimeout(resolve, 300))
 
-    // Step 6: Seal the entrance (place a block above to close the 1-block entrance)
-    // Find a block to place (dirt, cobblestone, anything solid)
-    const sealBlocks = ['dirt', 'cobblestone', 'stone', 'andesite', 'diorite', 'granite',
-      'deepslate', 'oak_planks', 'spruce_planks', 'birch_planks', 'sandstone',
-      'netherrack', 'oak_log', 'spruce_log', 'birch_log']
-
+    // Step 7: Seal the entrance from below
     let sealed = false
     for (const blockName of sealBlocks) {
       const item = bot.inventory.items().find(i => i.name === blockName)
@@ -1615,12 +1733,37 @@ app.post('/action/build_shelter', async (req, res) => {
       }
     }
 
-    // STEP 4: Door — break 2 blocks on the north wall for entry
+    // STEP 4: Door — break 2 wall blocks and place an actual door if available
+    let doorPlaced = false
     try {
       const door1 = bot.blockAt(new Vec3(bx, by, bz - S))
       const door2 = bot.blockAt(new Vec3(bx, by + 1, bz - S))
       if (door1 && door1.name !== 'air') await bot.dig(door1)
       if (door2 && door2.name !== 'air') await bot.dig(door2)
+      await new Promise(r => setTimeout(r, 200))
+
+      // Try to place an actual door
+      const doorItem = bot.inventory.items().find(i => i.name.includes('door'))
+      if (doorItem) {
+        // Move outside the door opening to place it
+        try {
+          await bot.pathfinder.goto(new goals.GoalNear(bx, by, bz - S - 1, 1))
+        } catch (e) {}
+        await new Promise(r => setTimeout(r, 200))
+
+        // Place door on the floor block below the opening
+        const floorBlock = bot.blockAt(new Vec3(bx, by - 1, bz - S))
+        if (floorBlock && floorBlock.name !== 'air' && floorBlock.boundingBox === 'block') {
+          try {
+            await bot.equip(doorItem, 'hand')
+            await bot.placeBlock(floorBlock, new Vec3(0, 1, 0))
+            await new Promise(r => setTimeout(r, 100))
+            doorPlaced = true
+          } catch (e) {
+            console.log(`[build_shelter] Door placement failed: ${e.message}`)
+          }
+        }
+      }
     } catch (e) {}
 
     // Move back inside
@@ -1628,10 +1771,11 @@ app.post('/action/build_shelter', async (req, res) => {
       await bot.pathfinder.goto(new goals.GoalNear(bx, by, bz, 0))
     } catch (e) {}
 
-    bot.chat(`Shelter built! ${placed} blocks placed.`)
+    const doorMsg = doorPlaced ? 'Door placed.' : 'Door opening (no door item).'
+    bot.chat(`Shelter built! ${placed} blocks placed. ${doorMsg}`)
     res.json({
       success: true,
-      message: `Built 5x3x5 shelter with ${placed} blocks (${materialName}) at (${bx}, ${by}, ${bz}). Roof complete. Door on north side.${failed > 0 ? ` (${failed} blocks couldn't be placed)` : ''}`
+      message: `Built 5x3x5 shelter with ${placed} blocks (${materialName}) at (${bx}, ${by}, ${bz}). Roof complete. ${doorMsg}${failed > 0 ? ` (${failed} blocks couldn't be placed)` : ''}`
     })
   } catch (err) {
     res.json({ success: false, message: err.message })
