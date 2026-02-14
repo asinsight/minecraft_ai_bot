@@ -24,6 +24,7 @@ bot.loadPlugin(pathfinder)
 
 let botReady = false
 let lastChatMessages = []
+let lastReadChatIndex = 0  // Track which messages agent has seen
 
 // ── Death Tracking ──
 let deathLog = []
@@ -36,6 +37,55 @@ const app = express()
 app.use(express.json())
 
 // ── STATE ENDPOINTS ──
+
+// ── Auto-equip best tool helper (used by mine, dig_down, dig_tunnel, dig_shelter) ──
+async function autoEquipBestTool(blockName) {
+  if (!blockName) blockName = 'stone'
+
+  const pickaxeBlocks = ['stone', 'cobblestone', 'iron_ore', 'coal_ore', 'gold_ore',
+    'diamond_ore', 'copper_ore', 'redstone_ore', 'lapis_ore', 'emerald_ore',
+    'deepslate', 'andesite', 'diorite', 'granite', 'netherrack', 'obsidian',
+    'nether_quartz_ore', 'nether_gold_ore', 'sandstone', 'blackstone', 'basalt',
+    'end_stone', 'terracotta', 'bricks', 'prismarine', 'concrete']
+  const axeBlocks = ['log', 'wood', 'planks', 'fence', 'door', 'bookshelf',
+    'crafting_table', 'chest', 'barrel', 'sign', 'bamboo', 'mushroom_block']
+  const shovelBlocks = ['dirt', 'grass_block', 'sand', 'gravel', 'clay',
+    'soul_sand', 'soul_soil', 'snow', 'mud', 'mycelium', 'podzol', 'farmland']
+
+  let toolType = null
+  for (const kw of pickaxeBlocks) {
+    if (blockName.includes(kw)) { toolType = 'pickaxe'; break }
+  }
+  if (!toolType) {
+    for (const kw of axeBlocks) {
+      if (blockName.includes(kw)) { toolType = 'axe'; break }
+    }
+  }
+  if (!toolType) {
+    for (const kw of shovelBlocks) {
+      if (blockName.includes(kw)) { toolType = 'shovel'; break }
+    }
+  }
+
+  if (!toolType) toolType = 'pickaxe'
+
+  // Search inventory for best tool of this type
+  const tiers = ['netherite', 'diamond', 'iron', 'stone', 'wooden', 'golden']
+  const available = bot.inventory.items().map(i => i.name)
+  console.log(`[auto-equip] Block: "${blockName}" → need: ${toolType} | inventory: ${available.filter(n => n.includes(toolType) || n.includes('sword') || n.includes('axe') || n.includes('pickaxe') || n.includes('shovel')).join(', ') || 'no tools'}`)
+
+  for (const tier of tiers) {
+    const toolName = `${tier}_${toolType}`
+    const item = bot.inventory.items().find(i => i.name === toolName)
+    if (item) {
+      await bot.equip(item, 'hand')
+      console.log(`[auto-equip] Equipped ${toolName}`)
+      return toolName
+    }
+  }
+  console.log(`[auto-equip] No ${toolType} found! Using fist.`)
+  return null
+}
 
 // GET /state - Full world state
 app.get('/state', (req, res) => {
@@ -170,6 +220,15 @@ app.get('/nearby', (req, res) => {
 // GET /chat
 app.get('/chat', (req, res) => {
   res.json({ messages: lastChatMessages.slice(-20) })
+})
+
+// GET /chat/unread - Get new chat messages since last check (for agent priority)
+app.get('/chat/unread', (req, res) => {
+  const unread = lastChatMessages.slice(lastReadChatIndex)
+  lastReadChatIndex = lastChatMessages.length
+  // Filter out bot's own messages
+  const playerMessages = unread.filter(m => m.username !== bot.username)
+  res.json({ messages: playerMessages, count: playerMessages.length })
 })
 
 // GET /threat_assessment - Evaluate combat readiness vs nearby threats
@@ -496,6 +555,52 @@ app.post('/action/mine', async (req, res) => {
     const mineCount = count || 1
     let mined = 0
 
+    // Auto-equip best tool for the job
+    const equippedTool = await autoEquipBestTool(block_type)
+
+    // Blocks that REQUIRE a tool (can't mine with fist or drop nothing)
+    const requiresPickaxe = ['iron_ore', 'coal_ore', 'gold_ore', 'diamond_ore', 'copper_ore',
+      'redstone_ore', 'lapis_ore', 'emerald_ore', 'nether_quartz_ore', 'nether_gold_ore',
+      'obsidian', 'deepslate_iron_ore', 'deepslate_coal_ore', 'deepslate_gold_ore',
+      'deepslate_diamond_ore', 'deepslate_copper_ore', 'deepslate_redstone_ore',
+      'deepslate_lapis_ore', 'deepslate_emerald_ore']
+    const requiresTool = ['stone', 'cobblestone', 'deepslate', ...requiresPickaxe]
+
+    const needsTool = requiresTool.some(kw => block_type.includes(kw))
+    if (needsTool && !equippedTool) {
+      return res.json({
+        success: false,
+        message: `Cannot mine ${block_type} without a tool! Craft a pickaxe first: wood → planks → sticks → crafting_table → wooden_pickaxe. Then upgrade: cobblestone → stone_pickaxe → iron_ore needs stone_pickaxe or better.`
+      })
+    }
+
+    // Iron ore specifically needs stone pickaxe or better
+    const needsStonePlus = requiresPickaxe.some(kw => block_type.includes(kw))
+    if (needsStonePlus && equippedTool && equippedTool.startsWith('wooden_')) {
+      return res.json({
+        success: false,
+        message: `${block_type} needs stone_pickaxe or better! A wooden_pickaxe won't drop anything. Craft stone_pickaxe first (3 cobblestone + 2 sticks at crafting table).`
+      })
+    }
+
+    // Diamond ore needs iron pickaxe or better
+    const needsIronPlus = ['diamond_ore', 'deepslate_diamond_ore', 'gold_ore', 'deepslate_gold_ore',
+      'emerald_ore', 'deepslate_emerald_ore', 'redstone_ore', 'deepslate_redstone_ore']
+    const needsIron = needsIronPlus.some(kw => block_type.includes(kw))
+    if (needsIron && equippedTool && (equippedTool.startsWith('wooden_') || equippedTool.startsWith('stone_'))) {
+      return res.json({
+        success: false,
+        message: `${block_type} needs iron_pickaxe or better! Your ${equippedTool} won't drop anything. Smelt iron ore → iron ingot → craft iron_pickaxe first.`
+      })
+    }
+
+    // Warn if mining wood without an axe (works but very slow)
+    const isWood = ['log', 'wood', 'planks'].some(kw => block_type.includes(kw))
+    if (isWood && !equippedTool) {
+      // Allow it but warn — first few logs are always by hand
+      console.log(`[auto-equip] Mining ${block_type} by hand (slow). Craft an axe to speed up.`)
+    }
+
     for (let i = 0; i < mineCount; i++) {
       const block = bot.findBlock({
         matching: b => b.name.includes(block_type),
@@ -515,6 +620,11 @@ app.post('/action/mine', async (req, res) => {
         // Try to proceed even if pathfinding is imperfect
       }
       clearTimeout(moveTimeout)
+
+      // Re-equip if tool broke
+      if (equippedTool && !bot.inventory.items().find(i => i.name === equippedTool)) {
+        await autoEquipBestTool(block_type)
+      }
 
       // Dig
       const targetBlock = bot.blockAt(block.position)
@@ -539,7 +649,8 @@ app.post('/action/mine', async (req, res) => {
       }
     }
 
-    res.json({ success: true, message: `Mined ${mined} ${block_type}` })
+    const toolMsg = equippedTool ? ` (using ${equippedTool})` : ' (no tool available — used fist!)'
+    res.json({ success: true, message: `Mined ${mined} ${block_type}${toolMsg}` })
   } catch (err) {
     res.json({ success: false, message: err.message })
   }
@@ -1051,6 +1162,9 @@ app.post('/action/dig_shelter', async (req, res) => {
 
     bot.chat('Digging emergency shelter!')
 
+    // Auto-equip best pickaxe/shovel
+    await autoEquipBestTool('stone')
+
     // Dig a 3x3x3 room below the bot
     // Step 1: Dig down 1 block (entrance)
     const entranceBlock = bot.blockAt(pos.offset(0, -1, 0))
@@ -1156,6 +1270,15 @@ app.post('/action/dig_down', async (req, res) => {
 
     bot.chat(`Mining downward to y=${targetY}...`)
 
+    // Auto-equip best pickaxe
+    const digTool = await autoEquipBestTool('stone')
+    if (!digTool) {
+      return res.json({
+        success: false,
+        message: 'Cannot dig without a pickaxe! Craft one first: wood → planks → sticks → crafting_table → wooden_pickaxe → mine cobblestone → stone_pickaxe.'
+      })
+    }
+
     // Staircase pattern: dig 2 blocks forward + 1 down, repeat
     const directions = [
       new Vec3(1, 0, 0),
@@ -1253,6 +1376,15 @@ app.post('/action/dig_tunnel', async (req, res) => {
     }
 
     bot.chat(`Digging tunnel ${direction}, ${tunnelLength} blocks...`)
+
+    // Auto-equip best pickaxe
+    const tunnelTool = await autoEquipBestTool('stone')
+    if (!tunnelTool) {
+      return res.json({
+        success: false,
+        message: 'Cannot dig tunnel without a pickaxe! Craft one first: wood → planks → sticks → crafting_table → wooden_pickaxe → mine cobblestone → stone_pickaxe.'
+      })
+    }
 
     let currentPos = pos.clone()
     const oresFound = {}
@@ -1608,6 +1740,195 @@ bot.on('end', () => {
 // ============================================
 // START API SERVER
 // ============================================
+// POST /action/scan_structure - Scan blocks around a position and save the structure
+app.post('/action/scan_structure', async (req, res) => {
+  if (!botReady) return res.status(503).json({ error: 'Bot not ready' })
+  try {
+    const { name, radius } = req.body
+    const r = radius || 5
+    const center = bot.entity.position.floored()
+    const blocks = []
+
+    for (let dx = -r; dx <= r; dx++) {
+      for (let dy = -r; dy <= r; dy++) {
+        for (let dz = -r; dz <= r; dz++) {
+          const pos = center.offset(dx, dy, dz)
+          const block = bot.blockAt(pos)
+          if (block && block.name !== 'air') {
+            blocks.push({
+              dx, dy, dz,
+              name: block.name,
+              x: pos.x, y: pos.y, z: pos.z
+            })
+          }
+        }
+      }
+    }
+
+    const structure = {
+      name: name || 'unnamed_structure',
+      center: { x: center.x, y: center.y, z: center.z },
+      radius: r,
+      blocks: blocks,
+      scanned_at: Date.now(),
+      block_count: blocks.length
+    }
+
+    // Save to file
+    const fs = require('fs')
+    let structures = {}
+    try {
+      structures = JSON.parse(fs.readFileSync('structures.json', 'utf8'))
+    } catch (e) {}
+    structures[structure.name] = structure
+    fs.writeFileSync('structures.json', JSON.stringify(structures, null, 2))
+
+    // Summarize block types
+    const typeCounts = {}
+    blocks.forEach(b => { typeCounts[b.name] = (typeCounts[b.name] || 0) + 1 })
+    const summary = Object.entries(typeCounts)
+      .sort((a, b) => b[1] - a[1])
+      .map(([name, count]) => `${name} x${count}`)
+      .join(', ')
+
+    res.json({
+      success: true,
+      message: `Scanned "${structure.name}": ${blocks.length} blocks in radius ${r}. Types: ${summary}. Structure saved to structures.json.`
+    })
+  } catch (err) {
+    res.json({ success: false, message: err.message })
+  }
+})
+
+// GET /action/list_structures - List all saved structures
+app.get('/action/list_structures', (req, res) => {
+  try {
+    const fs = require('fs')
+    let structures = {}
+    try {
+      structures = JSON.parse(fs.readFileSync('structures.json', 'utf8'))
+    } catch (e) {
+      return res.json({ success: true, structures: [], message: 'No saved structures.' })
+    }
+
+    const list = Object.values(structures).map(s => ({
+      name: s.name,
+      center: s.center,
+      block_count: s.block_count,
+      radius: s.radius,
+      scanned_at: s.scanned_at
+    }))
+
+    res.json({ success: true, structures: list })
+  } catch (err) {
+    res.json({ success: false, message: err.message })
+  }
+})
+
+// POST /action/rebuild_structure - Rebuild a saved structure at its original or new location
+app.post('/action/rebuild_structure', async (req, res) => {
+  if (!botReady) return res.status(503).json({ error: 'Bot not ready' })
+  try {
+    const { name, offset_x, offset_y, offset_z } = req.body
+    const fs = require('fs')
+    let structures = {}
+    try {
+      structures = JSON.parse(fs.readFileSync('structures.json', 'utf8'))
+    } catch (e) {
+      return res.json({ success: false, message: 'No structures.json file found.' })
+    }
+
+    const structure = structures[name]
+    if (!structure) {
+      const available = Object.keys(structures).join(', ')
+      return res.json({ success: false, message: `Structure "${name}" not found. Available: ${available}` })
+    }
+
+    const ox = offset_x || 0
+    const oy = offset_y || 0
+    const oz = offset_z || 0
+
+    let placed = 0
+    let failed = 0
+    let missingBlocks = {}
+
+    // Sort blocks bottom to top for stable placement
+    const sortedBlocks = [...structure.blocks].sort((a, b) => a.dy - b.dy)
+
+    for (const block of sortedBlocks) {
+      const targetPos = new Vec3(
+        structure.center.x + block.dx + ox,
+        structure.center.y + block.dy + oy,
+        structure.center.z + block.dz + oz
+      )
+
+      // Check if already has the right block
+      const existing = bot.blockAt(targetPos)
+      if (existing && existing.name === block.name) {
+        placed++ // already there
+        continue
+      }
+
+      // Find block in inventory
+      const item = bot.inventory.items().find(i => i.name === block.name)
+      if (!item) {
+        missingBlocks[block.name] = (missingBlocks[block.name] || 0) + 1
+        failed++
+        continue
+      }
+
+      // Move close if needed
+      const dist = bot.entity.position.distanceTo(targetPos)
+      if (dist > 4) {
+        try {
+          const moveTimeout = setTimeout(() => { bot.pathfinder.setGoal(null) }, 10000)
+          await bot.pathfinder.goto(new goals.GoalNear(targetPos.x, targetPos.y, targetPos.z, 3))
+          clearTimeout(moveTimeout)
+        } catch (e) {}
+      }
+
+      // Place
+      try {
+        await bot.equip(item, 'hand')
+        // Find a reference block to place against
+        const neighbors = [
+          targetPos.offset(0, -1, 0), targetPos.offset(0, 1, 0),
+          targetPos.offset(1, 0, 0), targetPos.offset(-1, 0, 0),
+          targetPos.offset(0, 0, 1), targetPos.offset(0, 0, -1)
+        ]
+        let refBlock = null
+        for (const np of neighbors) {
+          const nb = bot.blockAt(np)
+          if (nb && nb.name !== 'air') {
+            refBlock = nb
+            break
+          }
+        }
+        if (refBlock) {
+          await bot.placeBlock(refBlock, targetPos.minus(refBlock.position))
+          placed++
+        } else {
+          failed++
+        }
+      } catch (e) {
+        failed++
+      }
+    }
+
+    let msg = `Rebuilt "${name}": ${placed} placed, ${failed} failed.`
+    if (Object.keys(missingBlocks).length > 0) {
+      const missing = Object.entries(missingBlocks)
+        .map(([n, c]) => `${n} x${c}`)
+        .join(', ')
+      msg += ` Missing materials: ${missing}`
+    }
+
+    res.json({ success: true, message: msg })
+  } catch (err) {
+    res.json({ success: false, message: err.message })
+  }
+})
+
 app.listen(API_PORT, () => {
   console.log(`🌐 API server running on http://localhost:${API_PORT}`)
   console.log('📡 Endpoints:')

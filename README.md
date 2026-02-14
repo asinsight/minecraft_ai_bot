@@ -16,6 +16,7 @@ Powered by LangChain Agent + Local LLM (GLM-4.7-Flash). Zero API cost for autono
 │    [Node.js] Mineflayer + Express REST API        │
 │    server.js                                      │
 │    - Bot connection, world interaction             │
+│    - Auto-equip best tool/weapon for every action  │
 │    - Environment detection (surface/cave/indoor)   │
 │    - Smart combat (heal, flee, auto-equip)         │
 │    - Threat assessment engine                      │
@@ -39,7 +40,7 @@ Powered by LangChain Agent + Local LLM (GLM-4.7-Flash). Zero API cost for autono
 │      │   goal_planner.py  "Mine 3 iron ore" etc.  │
 │      │                                             │
 │      ├── Death Analyzer ─ Learn from mistakes      │
-│      │   death_analyzer.py Lessons persist         │
+│      │   death_analyzer.py  death_lessons.json     │
 │      │                                             │
 │      ├── Spatial Memory ─ Remember places          │
 │      │   spatial_memory.py waypoints.json          │
@@ -123,6 +124,7 @@ The LLM might decide:
 
 ```
 ┌─ 1. Threat Assessment ── fight / avoid / flee?
+│     (skipped if sheltered + threats far away)
 │
 ├─ 2. Survival Check ───── health < 5? hunger < 5? override!
 │
@@ -133,6 +135,26 @@ The LLM might decide:
 ├─ 5. GoalPlanner Context ─ current step of active task?
 │
 └─ 6. LLM Decides ──────── picks tools, executes, advances progress
+```
+
+### Auto-Equip: Never Mine or Fight Barehanded
+
+Every action automatically equips the best available tool — the LLM doesn't need to call `equip_item` manually. This is enforced at the server level, not dependent on LLM judgment:
+
+```
+mine_block("oak_log")    → auto-equips: diamond_axe > iron_axe > stone_axe > wooden_axe
+mine_block("iron_ore")   → auto-equips: diamond_pickaxe > iron_pickaxe > stone_pickaxe
+mine_block("dirt")        → auto-equips: diamond_shovel > iron_shovel > stone_shovel
+attack_entity("zombie")  → auto-equips: diamond_sword > iron_sword > stone_sword
+dig_down / dig_tunnel     → auto-equips: best pickaxe available
+dig_shelter               → auto-equips: best pickaxe available
+```
+
+If a tool breaks mid-action, the next best tool is auto-equipped. The response always reports what tool was used:
+```
+"Mined 3 iron_ore (using stone_pickaxe)"
+"Mined 5 oak_log (using iron_axe)"
+"Mined 2 stone (no tool available — used fist!)"
 ```
 
 ### Environment Awareness
@@ -152,8 +174,6 @@ Invoking: `get_world_state`
   Nearby entities: zombie(12m), bat(6m)
 ```
 
-Environment is detected by scanning upward from the bot's head for solid blocks:
-
 | Environment | Detection | Icon |
 |-------------|-----------|------|
 | Surface | Sky visible (no solid blocks above within 64 blocks) | 🌍 |
@@ -162,10 +182,24 @@ Environment is detected by scanning upward from the bot's head for solid blocks:
 | Deep Underground | Sky blocked + y < 0 (deepslate layer) | 🕳️ |
 | Dark warning | Light level < 8 (hostile mobs can spawn here) | ⚠️ |
 
-This lets the LLM make contextual decisions:
-- "I'm underground and it's dark → place torches"
-- "I'm in a cave with a zombie nearby → fight or flee?"
-- "I'm indoors in my shelter → safe, can craft"
+### Shelter-Aware Survival
+
+The bot won't panic and run outside when it's already safe:
+
+```
+check_survival_override()
+  │
+  ├─ Is sheltered? (indoors / underground / deep_underground)
+  │   ├─ Threats > 10m away → ignore, continue working
+  │   ├─ Threats 5-10m → "STAY INSIDE, don't go out"
+  │   └─ Threats < 5m → "Fight it or seal entrance"
+  │
+  ├─ NOT sheltered + flee? → run / dig_shelter
+  ├─ NOT sheltered + night? → "get underground NOW"
+  └─ Sheltered + night? → nothing (safe, keep working)
+```
+
+Previously, the bot would detect a creeper 22m away while inside a shelter and panic-flee outside into more danger. Now it stays put.
 
 ### Death → Reassess → Adapt
 
@@ -180,21 +214,20 @@ When the bot dies, it doesn't just resume what it was doing:
   ├─ 2. Death snapshot captured
   │     health=3, zombie(2m)+skeleton(5m), night, weapon=fist
   │
-  ├─ 3. LLM analyzes → lesson stored
+  ├─ 3. LLM analyzes → lesson stored → saved to death_lessons.json
   │     [HIGH] "Craft a sword before exploring at night"
   │
   ├─ 4. LLM re-evaluates with full context:
   │     "I died because no weapon. Available tasks include
-  │      make_iron_sword and build_shelter. I'll do those first
-  │      before going back to mining."
+  │      make_iron_sword and build_shelter. I'll do those first."
   │
-  └─ 5. Lessons persist — every future tick sees:
-        ⚠️ LESSONS FROM PAST DEATHS:
+  └─ 5. Lessons persist forever (file + prompt injection):
+        ⚠️ LESSONS FROM 3 PAST DEATH(S):
           [HIGH] Craft sword before nightfall
           [MED] Carry food when exploring far from base
 ```
 
-The bot gets smarter with every death. Lessons are injected into every future prompt, influencing all decisions.
+The bot gets smarter with every death. Lessons survive restarts via `death_lessons.json`.
 
 ### Smart Combat AI
 
@@ -218,15 +251,13 @@ GET /threat_assessment
 | `flee` | Danger! Run to shelter or `dig_shelter` underground |
 
 **During combat**, the bot:
-- Auto-equips the best available weapon (diamond_sword > iron > stone > wood > fist)
+- Auto-equips the best available weapon
 - Chases the target and attacks until it dies
 - Eats food mid-fight if health drops below 8
 - Flees immediately if health ≤ 4 and no food left
 - Avoids creepers at close range (explosion risk)
 - Unconditionally runs from Wardens
 - Auto-collects item drops after a kill
-
-**Pre-combat check**: Won't engage if unarmed + low health → flees and reports "Craft a sword first."
 
 ### Smelting & Iron Age
 
@@ -242,92 +273,49 @@ smelt_item("raw_iron", 3)
   └─ Result: "Smelted raw_iron → got iron_ingot x3"
 ```
 
-**Full iron chain now works end-to-end:**
+**Full iron chain works end-to-end:**
 ```
 stone_pickaxe → mine iron_ore (3) → mine coal (3) → craft furnace
 → smelt raw_iron → iron_ingot × 3 → craft iron_pickaxe
 ```
 
-**No coal? Make charcoal:** `smelt_item("oak_log")` using planks as fuel → charcoal.
-
 ### Shelter: Build vs Dig
-
-Two shelter strategies depending on the situation:
 
 | Situation | Tool | How it works |
 |-----------|------|-------------|
-| Have 20+ blocks (cobble, dirt, planks) | `build_shelter` | Builds 5×3×5 enclosed room on surface |
-| Emergency, no blocks, night coming | `dig_shelter` | Digs 3×3×3 underground room, seals entrance |
-
-```
-dig_shelter
-  ├─ Dig entrance shaft (2 blocks down)
-  ├─ Carve 3×3×3 room underground
-  ├─ Move bot inside
-  ├─ Seal entrance with any available block
-  └─ Safe from all mobs! No materials needed.
-```
-
-When fleeing from threats with no saved shelter nearby, the bot can `dig_shelter` to instantly hide.
+| Have 20+ blocks | `build_shelter` | 5×3×5 enclosed room on surface (walls + roof) |
+| Emergency, no blocks | `dig_shelter` | 3×3×3 underground room, entrance sealed |
 
 ### Directional Mining
 
-For reaching ore levels and strip mining:
-
 | Tool | What it does |
 |------|-------------|
-| `dig_down(target_y=12)` | Staircase mine downward, stops at target Y or on lava |
-| `dig_tunnel("north", 20)` | Horizontal 1×2 tunnel, reports ores found, stops on lava |
-
-```
-dig_down(target_y=12)
-  ├─ Mines staircase pattern (2-high, 1 down each step)
-  ├─ Checks for lava below each step → auto-stops
-  └─ "Reached y=12 (40 blocks). Diamond level!"
-
-dig_tunnel("east", 30)
-  ├─ Digs 1×2 horizontal tunnel
-  ├─ Tracks ores encountered while digging
-  ├─ Stops on lava
-  └─ "Tunnel complete: 30 blocks east at y=12. Ores found: iron_ore×4, diamond_ore×2"
-```
+| `dig_down(target_y=12)` | Staircase mine downward, lava auto-stop |
+| `dig_tunnel("north", 20)` | Horizontal 1×2 tunnel, reports ores found |
 
 ### Spatial Memory
 
-The bot remembers important locations, persisted in `waypoints.json` across restarts:
+Locations persist in `waypoints.json` across restarts:
 
 ```
 📍 KNOWN LOCATIONS (5):
-  [CRAFTING]
-    crafting_table: (105, 64, -48) (12m)
-    furnace: (107, 64, -48) (14m)
-  [SHELTER]
-    shelter: (100, 64, -50) (8m) — Enclosed 5x3x5 cobblestone
-    shelter_2: (95, 58, -55) (18m) — Emergency underground shelter
-  [STORAGE]
-    chest: (103, 64, -49) (10m)
-  [RESOURCE]
-    iron_cave: (80, 32, -60) (45m) — Found iron ore vein
+  [CRAFTING] crafting_table: (105, 64, -48) (12m)
+  [CRAFTING] furnace: (107, 64, -48) (14m)
+  [SHELTER]  shelter: (100, 64, -50) (8m)
+  [STORAGE]  chest: (103, 64, -49) (10m)
+  [RESOURCE] iron_cave: (80, 32, -60) (45m)
 ```
-
-**Auto-saved**: crafting table, chest, furnace, bed, shelter (both types).
-
-**Manually saved**: resource veins, villages, points of interest (LLM decides).
-
-**Used for navigation**: "Need to craft? → `find_nearest_location('crafting')` → walk there" instead of building a new one.
 
 ---
 
 ## Persistence (Survives Restarts)
 
-| Data | File | Survives restart? |
+| Data | File | Persists? |
 |------|------|:-:|
 | Grand goal progress | `grand_goal_state.json` | ✅ |
-| Death lessons | in-memory (death_analyzer) | ❌ (planned) |
+| Death lessons | `death_lessons.json` | ✅ |
 | Saved locations | `waypoints.json` | ✅ |
-| GoalPlanner current task | in-memory | ❌ (resets, LLM picks new) |
-
-Grand goal phase/task completion is saved after every state change. On restart, the bot loads progress and continues from where it left off. The LLM will pick a new task from the available set.
+| GoalPlanner current task | in-memory | ❌ (LLM picks new) |
 
 ---
 
@@ -336,18 +324,18 @@ Grand goal phase/task completion is saved after every state change. On restart, 
 ### Perception (7)
 | Tool | Description |
 |------|-------------|
-| `get_world_state` | Full snapshot: position, health, inventory, entities, time, **environment** (surface/cave/indoor + light + dark warning) |
+| `get_world_state` | Position, health, inventory, entities, time, **environment** (surface/cave/indoor + light) |
 | `get_inventory` | Detailed inventory contents |
 | `get_nearby` | Block counts and entity list within range |
 | `find_block` | Find nearest block of a specific type |
 | `assess_threat` | Combat readiness vs nearby threats → fight/avoid/flee |
-| `get_recipe` | Look up crafting recipe + check what's missing from inventory |
-| `search_item` | Search item/block names by keyword (minecraft-data DB) |
+| `get_recipe` | Look up crafting recipe + check what's missing |
+| `search_item` | Search item/block names by keyword |
 
 ### Movement (5)
 | Tool | Description |
 |------|-------------|
-| `move_to` | Move to x, y, z coordinates |
+| `move_to` | Move to coordinates (dynamic timeout based on distance) |
 | `move_to_player` | Move to a specific player |
 | `follow_player` | Continuously follow a player |
 | `explore` | Walk in a random direction |
@@ -356,25 +344,25 @@ Grand goal phase/task completion is saved after every state change. On restart, 
 ### Resource / Combat (3)
 | Tool | Description |
 |------|-------------|
-| `mine_block` | Mine blocks by type (with pathfinding + auto-collect drops) |
+| `mine_block` | Mine blocks by type (**auto-equips** best pickaxe/axe/shovel) |
 | `place_block` | Place a block from inventory (auto-saves important blocks to memory) |
-| `attack_entity` | Smart combat: chase → hit until dead → heal mid-fight → flee if losing → collect drops |
+| `attack_entity` | Smart combat (**auto-equips** best weapon, heal, flee, collect drops) |
 
 ### Mining (2)
 | Tool | Description |
 |------|-------------|
-| `dig_down` | Staircase mine downward to a target Y level. Lava detection auto-stop |
-| `dig_tunnel` | Horizontal 1×2 tunnel in a direction. Reports ores found. Lava auto-stop |
+| `dig_down` | Staircase mine downward (**auto-equips** pickaxe). Lava auto-stop |
+| `dig_tunnel` | Horizontal tunnel (**auto-equips** pickaxe). Reports ores found |
 
 ### Survival (7)
 | Tool | Description |
 |------|-------------|
-| `eat_food` | Eat best available food from inventory |
-| `equip_item` | Equip weapon/armor/tool to hand or armor slot |
-| `craft_item` | Craft items (auto-detects crafting table, walks to it if needed) |
-| `smelt_item` | Smelt in furnace (auto-crafts furnace if needed). Requires fuel |
-| `dig_shelter` | Emergency: dig 3×3×3 underground room + seal entrance. No blocks needed |
-| `build_shelter` | Build enclosed 5×3×5 shelter with walls + roof (needs 20+ blocks) |
+| `eat_food` | Eat best available food |
+| `equip_item` | Manually equip specific item (rarely needed — most actions auto-equip) |
+| `craft_item` | Craft items (auto-finds crafting table) |
+| `smelt_item` | Smelt in furnace (auto-crafts furnace if needed) |
+| `dig_shelter` | Emergency underground shelter (**auto-equips** pickaxe). No blocks needed |
+| `build_shelter` | Build 5×3×5 enclosed shelter (roof built edge→center for reliability) |
 | `sleep_in_bed` | Sleep in a nearby bed |
 
 ### Communication (1)
@@ -396,8 +384,8 @@ Grand goal phase/task completion is saved after every state change. On restart, 
 ### Grand Goal (4)
 | Tool | Description |
 |------|-------------|
-| `set_grand_goal` | Set ultimate objective |
-| `complete_grand_task` | Mark a major milestone done → unlock dependents |
+| `set_grand_goal` | Set ultimate objective (ender_dragon / full_iron / cozy_base) |
+| `complete_grand_task` | Mark a milestone done → unlock dependents |
 | `skip_grand_task` | Skip optional tasks |
 | `get_grand_goal_status` | See full dependency graph + available tasks |
 
@@ -405,7 +393,7 @@ Grand goal phase/task completion is saved after every state change. On restart, 
 | Tool | Description |
 |------|-------------|
 | `check_death` | Detect if bot just died, get snapshot |
-| `learn_from_death` | Store a lesson from death analysis |
+| `learn_from_death` | Store a lesson (persisted to `death_lessons.json`) |
 | `get_lessons` | Review all stored death lessons |
 | `get_death_stats` | Death count and recent causes |
 
@@ -424,13 +412,11 @@ Grand goal phase/task completion is saved after every state change. On restart, 
 
 ### 🐉 Defeat the Ender Dragon (25 tasks, 6 phases)
 
-Tasks have dependencies — LLM freely chooses from unlocked tasks:
-
 ```
 Phase 1: Basic Survival
   get_wood ──→ make_crafting_table ──→ make_wooden_pickaxe ──→ make_stone_pickaxe
-  find_food (no dependency — available anytime)
-  build_shelter (no dependency — available anytime)
+  find_food (always available)
+  build_shelter (always available)
 
 Phase 2: Iron Age (requires smelting!)
   make_stone_pickaxe ──→ make_iron_pickaxe   [mine ore → smelt → craft]
@@ -450,93 +436,52 @@ Phase 4: The Nether
 Phase 5: Eyes of Ender
   kill_blazes ──→ craft_blaze_powder ─┐
   make_diamond_sword ──→ kill_endermen ├──→ craft_eyes
-                                       │
+
 Phase 6: The End
   craft_eyes ──→ find_stronghold ──→ activate_portal ──→ prepare_for_fight ──→ defeat_dragon
 ```
 
-### ⚔️ Full Iron Gear (8 tasks, 2 phases)
-```
-get_wood → crafting_table → wooden_pick → stone_pick → iron_pick + iron_sword + iron_armor + shield
-```
-
-### 🏠 Cozy Base (8 tasks, 2 phases)
-```
-Gather: wood, stone, iron (parallel)
-Build: shelter + crafting_table + furnace + chests + bed
-```
+### ⚔️ Full Iron Gear (8 tasks) · 🏠 Cozy Base (8 tasks)
 
 ---
 
-## Prerequisites
-
-- **Node.js** (v18+)
-- **Python** (3.10+)
-- **Minecraft Java Edition** (1.21.4)
-- **Local LLM** — Open WebUI + Ollama with GLM-4.7-Flash (or any model with tool calling)
-
 ## Setup
 
-### 1. Node.js (Mineflayer API Server)
+### Prerequisites
+- **Node.js** v18+ · **Python** 3.10+ · **Minecraft Java Edition** 1.21.4
+- **Local LLM** — Open WebUI + Ollama with GLM-4.7-Flash (or any model with tool calling)
+
+### Install
 
 ```bash
-cd minecraft-bot
+# Node.js
 npm install mineflayer mineflayer-pathfinder express dotenv minecraft-data vec3
-```
 
-### 2. Python (LangChain Agent)
-
-```bash
-python -m venv venv
-venv\Scripts\activate        # Windows
-# source venv/bin/activate   # Mac/Linux
+# Python
 pip install langchain langchain-openai requests python-dotenv
 ```
 
-### 3. Environment Variables
+### Configure `.env`
 
-```bash
-copy .env.example .env       # Windows
-# cp .env.example .env       # Mac/Linux
-```
-
-Edit `.env`:
 ```env
-# Minecraft Bot
 BOT_HOST=localhost
-BOT_PORT=55888               # LAN port from Minecraft
+BOT_PORT=55888
 BOT_USERNAME=PenguinBot
 BOT_VERSION=1.21.4
-
-# API Server
 API_PORT=3001
-
-# Local LLM (Open WebUI)
 LOCAL_LLM_BASE_URL=http://192.168.86.250:12000
 LOCAL_LLM_API_KEY=your-jwt-token
 LOCAL_LLM_MODEL=glm-4.7-flash:latest
-
-# Agent
 TICK_INTERVAL=5
 MAX_ITERATIONS=6
-
-# Claude API (optional — for player chat)
-ANTHROPIC_API_KEY=sk-your-key-here
 ```
 
-## Running
+### Run
 
-**Terminal 1 — Minecraft bot API server:**
 ```bash
-node server.js
+node server.js     # Terminal 1: Minecraft bot
+python agent.py    # Terminal 2: AI agent
 ```
-
-**Terminal 2 — AI Agent:**
-```bash
-python agent.py
-```
-
-> Make sure Minecraft is running with "Open to LAN" before starting.
 
 ---
 
@@ -544,91 +489,42 @@ python agent.py
 
 ```
 minecraft-bot/
-│
-├── server.js              # [Node.js] Mineflayer + Express REST API
-│                            Environment detection, smart combat, threat assessment,
-│                            death tracking, smelting, shelter (build + dig),
-│                            directional mining, item search
-│
-├── agent.py               # [Python] Main agent loop
-│                            Tick loop, survival override, death reassessment,
-│                            context injection (goal + death + memory)
-│
-├── tools.py               # 25+ LangChain tools (perception, combat, mining, survival)
-│
-├── grand_goal.py          # Grand goal system — dependency graph, phases, persistence
-├── grand_goal_tools.py    # LangChain tools for grand goal management
-├── grand_goal_state.json  # [Auto-generated] Saved grand goal progress
-│
-├── goal_planner.py        # Step-by-step task execution (8 predefined goals)
-├── goal_tools.py          # LangChain tools for goal step management
-│
-├── death_analyzer.py      # Death snapshot capture + lesson extraction
-├── death_tools.py         # LangChain tools for death learning
-│
-├── spatial_memory.py      # Named waypoint storage with categories + distances
-├── memory_tools.py        # LangChain tools for location memory
-├── waypoints.json         # [Auto-generated] Saved locations (persistent)
-│
-├── .env                   # Configuration (git-ignored)
-├── .env.example           # Template
-├── package.json           # Node.js dependencies
-├── requirements.txt       # Python dependencies
+├── server.js              # Mineflayer REST API (auto-equip, combat, smelt, dig, build)
+├── agent.py               # Agent loop (survival override, death reassess, context injection)
+├── tools.py               # 25+ LangChain tools
+├── grand_goal.py          # Dependency graph + persistence
+├── grand_goal_tools.py    # Grand goal LangChain tools
+├── grand_goal_state.json  # [auto] Grand goal progress
+├── goal_planner.py        # Step-by-step task execution
+├── goal_tools.py          # Goal LangChain tools
+├── death_analyzer.py      # Death snapshots + lesson learning + persistence
+├── death_tools.py         # Death LangChain tools
+├── death_lessons.json     # [auto] Persistent death lessons
+├── spatial_memory.py      # Waypoint storage with categories
+├── memory_tools.py        # Memory LangChain tools
+├── waypoints.json         # [auto] Persistent locations
+├── .env                   # Configuration
 └── README.md
 ```
 
 ---
 
-## Example Agent Log
+## Design Philosophy: Code > Prompts
 
-```
-══════════════════════════════════════════
-🔄 Tick #42
-🏆 Defeat the Ender Dragon [Tasks 8/25 (32%)]
-🎯 Active: make_iron_pickaxe [Step 5/10]
-══════════════════════════════════════════
+A key lesson from building with a small local LLM (3B active parameters):
 
-Invoking: `get_world_state`
-  Position: x=80.5, y=32.0, z=-60.3
-  Health: 18/20, Hunger: 16/20
-  Time: afternoon
-  Environment: ⛏️ Underground (cave/mine) ⚠️ DARK (roof 18 blocks up)
-  Nearby: stone, iron_ore, coal_ore, zombie(15m)
+**Mechanical actions are enforced in code, not prompted.** The LLM decides *what* to do (strategic), but the server handles *how* to do it (tactical):
 
-  "I'm underground near iron. Let me mine it and smelt."
+| Decision | Who decides | Why |
+|----------|-------------|-----|
+| "Should I mine iron or build shelter?" | **LLM** | Context-dependent strategy |
+| "Which pickaxe to equip before mining?" | **Server code** | Always the same answer: best available |
+| "Should I flee or fight this zombie?" | **LLM** (with threat assessment data) | Depends on gear, health, situation |
+| "Eat food when health < 8 mid-combat?" | **Server code** | Always yes — no judgment needed |
+| "Seal shelter entrance during flee?" | **Server code** | Always yes |
+| "Which task to do after dying?" | **LLM** | Requires analyzing death + available tasks |
 
-Invoking: `mine_block` with {'block_type': 'iron_ore', 'count': 3}
-  Mined 3 iron_ore → got raw_iron x3
-
-Invoking: `smelt_item` with {'item_name': 'raw_iron', 'count': 3}
-  Smelted raw_iron → got iron_ingot x3
-
-Invoking: `craft_item` with {'item_name': 'iron_pickaxe'}
-  Crafted iron_pickaxe
-
-✅ Agent: Found iron in cave, smelted, and crafted iron pickaxe!
-⏱️  Tick took 14.2s
-
-══════════════════════════════════════════
-🔄 Tick #55  (night, on surface)
-══════════════════════════════════════════
-
-⚔️ Threat: FLEE — Low health (6/20) and no food.
-
-Invoking: `get_world_state`
-  Environment: 🌍 Surface ⚠️ DARK (mobs can spawn!)
-  Nearby entities: zombie(8m), skeleton(14m)
-  No shelter saved nearby.
-
-  "Critical! Night, low health, no food, no shelter.
-   Digging emergency shelter NOW."
-
-Invoking: `dig_shelter`
-  Dug emergency underground shelter (22 blocks mined).
-  Entrance sealed! | 📍 Saved as 'shelter'
-
-✅ Agent: Emergency — dug underground shelter. Safe from mobs.
-```
+This means the bot works reliably even with a small model. The LLM only needs to make high-level decisions — everything else is automated.
 
 ---
 
@@ -638,52 +534,34 @@ Invoking: `dig_shelter`
 |-----------|------|
 | Autonomous agent loop | **$0** (local LLM) |
 | Player chat via Claude | ~500 tokens/message |
-| No player chat = no Claude calls | $0 |
 
 ---
 
 ## Roadmap
 
-- [x] Mineflayer REST API server (all endpoints)
+- [x] Mineflayer REST API server
 - [x] LangChain Agent with 25+ tools
-- [x] Grand Goal system with dependency graph (not fixed order)
-- [x] LLM autonomous task selection from available tasks
-- [x] Multi-step Goal Planner (8 predefined task chains)
-- [x] Environment detection (surface / cave / indoor / deep underground + light level)
-- [x] Smart combat AI (heal mid-fight, flee if losing, auto-equip)
-- [x] Threat assessment engine (fight/avoid/flee)
-- [x] Furnace smelting (auto-craft furnace, fuel detection)
-- [x] Full iron tool chain (ore → smelt → ingot → craft)
-- [x] Emergency underground shelter (dig + seal, no blocks needed)
-- [x] Directional mining (staircase down, horizontal tunnel, lava detection)
-- [x] Death analysis + lesson learning (injected into every prompt)
-- [x] Death → auto-cancel task → LLM reassesses approach
+- [x] Grand Goal system with dependency graph
+- [x] Auto-equip best tool/weapon for all actions
+- [x] Environment detection (surface/cave/indoor/deep + light level)
+- [x] Shelter-aware survival (don't flee when already safe)
+- [x] Smart combat AI (heal, flee, auto-equip)
+- [x] Threat assessment engine
+- [x] Furnace smelting (auto-craft furnace)
+- [x] Full iron tool chain (ore → smelt → craft)
+- [x] Emergency underground shelter (dig + seal)
+- [x] Directional mining (staircase, tunnel, lava detection)
+- [x] Death lessons with file persistence
+- [x] Death → auto-cancel → reassess
 - [x] Spatial memory with persistent waypoints
-- [x] Grand goal progress persistence (survives restarts)
-- [x] Item/block name search (minecraft-data integration)
-- [x] Surface shelter building (enclosed 5×3×5, mob-proof)
-- [x] .env configuration for all settings
+- [x] Grand goal persistence
+- [x] Reliable shelter building (roof edge→center)
+- [x] Dynamic move_to timeout (distance-based)
 - [ ] Nether navigation + portal building
-- [ ] Claude API integration for player conversation
-- [ ] Death lessons persistence to file
-- [ ] Chest inventory management (store/retrieve items)
+- [ ] Claude API for player conversation
+- [ ] Chest inventory management
 - [ ] Content automation (screenshots → social media)
 
 ---
 
-## Tech Stack
-
-- **Mineflayer** — Minecraft bot framework (Node.js)
-- **mineflayer-pathfinder** — Navigation and pathfinding
-- **Express** — REST API server
-- **minecraft-data** — Item/block/recipe database
-- **vec3** — 3D vector math for block placement
-- **LangChain** — Agent framework with tool calling
-- **GLM-4.7-Flash** — Local LLM (29.9B MoE, 3B active)
-- **Open WebUI + Ollama** — Local LLM inference server
-
----
-
-**Author**: Jun
-**Created**: 2026-02-13
-**Version**: v3.3 — Environment Awareness
+**Author**: Jun · **Version**: v3.4 — Auto-Equip, Death Persistence & Shelter-Aware Survival

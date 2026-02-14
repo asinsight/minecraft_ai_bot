@@ -76,6 +76,8 @@ class DeathAnalyzer:
     that gets injected into the agent's prompt.
     """
 
+    LESSONS_FILE = "death_lessons.json"
+
     def __init__(self, bot_api: str = None, max_lessons: int = 10):
         self.bot_api = bot_api or os.getenv("BOT_API_URL", "http://localhost:3001")
         self.death_log: list[DeathSnapshot] = []
@@ -86,6 +88,56 @@ class DeathAnalyzer:
         self.max_recent_actions = 20
         self._last_known_state: dict = {}       # cache last state for snapshot
         self._death_count = 0
+        self._load_lessons()
+
+    # ── Lesson Persistence ──
+
+    def _save_lessons(self):
+        """Save lessons to file for persistence across restarts."""
+        data = {
+            "death_count": self._death_count,
+            "next_id": self.next_lesson_id,
+            "lessons": [
+                {
+                    "id": l.id,
+                    "timestamp": l.timestamp,
+                    "cause": l.cause,
+                    "lesson": l.lesson,
+                    "prevention": l.prevention,
+                    "severity": l.severity,
+                    "times_relevant": l.times_relevant,
+                }
+                for l in self.lessons
+            ]
+        }
+        try:
+            with open(self.LESSONS_FILE, "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            print(f"⚠️ Failed to save death lessons: {e}")
+
+    def _load_lessons(self):
+        """Load lessons from file on startup."""
+        try:
+            if os.path.exists(self.LESSONS_FILE):
+                with open(self.LESSONS_FILE, "r") as f:
+                    data = json.load(f)
+                self._death_count = data.get("death_count", 0)
+                self.next_lesson_id = data.get("next_id", 1)
+                for ld in data.get("lessons", []):
+                    self.lessons.append(DeathLesson(
+                        id=ld["id"],
+                        timestamp=ld["timestamp"],
+                        cause=ld["cause"],
+                        lesson=ld["lesson"],
+                        prevention=ld.get("prevention", ld["lesson"]),
+                        severity=ld.get("severity", "medium"),
+                        times_relevant=ld.get("times_relevant", 0),
+                    ))
+                if self.lessons:
+                    print(f"📚 Loaded {len(self.lessons)} death lessons ({self._death_count} total deaths)")
+        except Exception as e:
+            print(f"⚠️ Failed to load death lessons: {e}")
 
     # ── State Tracking (call every tick) ──
 
@@ -119,6 +171,7 @@ class DeathAnalyzer:
                 return None
             self._last_death_time = death_time
             self._death_count += 1
+            self._save_lessons()
 
             # Build snapshot from cached state + death info
             state = self._last_known_state
@@ -163,6 +216,7 @@ class DeathAnalyzer:
                     )
                     self.death_log.append(snapshot)
                     self._death_count += 1
+                    self._save_lessons()
                     return snapshot
             except:
                 pass
@@ -216,6 +270,7 @@ class DeathAnalyzer:
                 existing.times_relevant += 1
                 if severity == "high":
                     existing.severity = "high"
+                self._save_lessons()
                 return f"Similar lesson already exists (updated relevance): {existing.lesson}"
 
         new_lesson = DeathLesson(
@@ -234,6 +289,7 @@ class DeathAnalyzer:
             self.lessons.sort(key=lambda l: (l.severity != "high", l.severity != "medium", -l.times_relevant))
             self.lessons = self.lessons[:self.max_lessons]
 
+        self._save_lessons()
         return f"New lesson learned: [{severity.upper()}] {lesson}"
 
     def add_lesson_manual(self, cause: str, lesson: str, severity: str = "medium") -> str:
@@ -248,6 +304,7 @@ class DeathAnalyzer:
         )
         self.next_lesson_id += 1
         self.lessons.append(new_lesson)
+        self._save_lessons()
         return f"Lesson added: [{severity.upper()}] {lesson}"
 
     # ── Prompt Generation ──

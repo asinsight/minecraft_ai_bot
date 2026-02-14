@@ -11,12 +11,15 @@ grand_manager = GrandGoalManager()
 
 @tool
 def set_grand_goal(goal_name: str) -> str:
-    """Set the ultimate game objective. Everything you do should work toward this.
+    """Set or CHANGE the ultimate game objective. Call this to start a new goal
+    or switch to a different one. Your current goal will be replaced.
 
     Available grand goals:
     - defeat_ender_dragon: The classic Minecraft endgame (6 phases, ~30 tasks)
     - full_iron_gear: Get complete iron tools and armor (2 phases)
     - cozy_base: Build a base with all crafting stations (2 phases)
+
+    You can switch goals anytime if the current one is too hard or boring.
 
     Args:
         goal_name: Name of the grand goal

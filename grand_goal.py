@@ -376,10 +376,26 @@ class GrandGoalManager:
     def get_status(self) -> dict:
         if not self.active_goal:
             return {"has_grand_goal": False}
+        goal = self.active_goal
+        all_tasks = []
+        completed = 0
+        for task in goal.tasks:
+            all_tasks.append({
+                "id": task.id,
+                "name": task.goal_name,
+                "description": task.description,
+                "status": task.status.value if hasattr(task.status, 'value') else str(task.status),
+            })
+            if task.status in (TaskStatus.COMPLETED, TaskStatus.SKIPPED):
+                completed += 1
         return {
             "has_grand_goal": True,
-            "name": self.active_goal.name,
-            "description": self.active_goal.description,
-            "progress": self.active_goal.overall_progress,
-            "available_tasks": [t.id for t in self.active_goal.get_available_tasks()],
+            "goal_name": goal.name,
+            "name": goal.name,
+            "description": goal.description,
+            "progress": goal.overall_progress,
+            "available_tasks": [t.id for t in goal.get_available_tasks()],
+            "all_tasks": all_tasks,
+            "completed_count": completed,
+            "total_count": len(all_tasks),
         }
