@@ -18,6 +18,7 @@ Everything else runs automatically.
 
 import time
 import os
+import sys
 import json
 import requests
 from typing import Optional
@@ -625,10 +626,40 @@ def tick_once(tick_num: int):
 
 
 # ============================================
+# LOG FILE OUTPUT
+# ============================================
+
+class TeeLogger:
+    """Writes to both stdout and a log file simultaneously."""
+    def __init__(self, log_dir="logs"):
+        os.makedirs(log_dir, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        self.log_path = os.path.join(log_dir, f"bot_{timestamp}.log")
+        self.log_file = open(self.log_path, "w", encoding="utf-8")
+        self.stdout = sys.stdout
+
+    def write(self, msg):
+        self.stdout.write(msg)
+        self.log_file.write(msg)
+        self.log_file.flush()
+
+    def flush(self):
+        self.stdout.flush()
+        self.log_file.flush()
+
+    def close(self):
+        self.log_file.close()
+
+
+# ============================================
 # MAIN LOOP
 # ============================================
 
 def run():
+    # Install TeeLogger to save all output to logs/ directory
+    tee = TeeLogger()
+    sys.stdout = tee
+    print(f"📝 Logging to: {tee.log_path}")
     print("=" * 60)
     print("🤖 Minecraft AI Agent v6 — Chain of Action")
     print(f"🧠 Planning: {LOCAL_LLM_MODEL} (action chains)")

@@ -717,35 +717,64 @@ app.post('/action/place', async (req, res) => {
       clearTimeout(timeout)
     }
 
-    // Find an air block adjacent to the bot (not where the bot stands) and place there
+    // Find an air block near the bot and place there
     const pos = bot.entity.position.floored()
-    const botBlock = pos // bot occupies this block — cannot place here
+    const botFeet = pos
+    const botHead = pos.offset(0, 1, 0)
 
-    // Candidate positions: sides first, then one block in front (based on yaw)
+    // Candidate positions: feet level → head level → above head (for underground shafts)
     const candidates = [
-      pos.offset(1, 0, 0), pos.offset(-1, 0, 0),
-      pos.offset(0, 0, 1), pos.offset(0, 0, -1),
+      // Priority 1: feet-level horizontal (works on surface)
+      pos.offset(1, 0, 0), pos.offset(-1, 0, 0), pos.offset(0, 0, 1), pos.offset(0, 0, -1),
+      // Priority 2: head-level horizontal (works in caves)
+      pos.offset(1, 1, 0), pos.offset(-1, 1, 0), pos.offset(0, 1, 1), pos.offset(0, 1, -1),
+      // Priority 3: above head (works in vertical shafts from dig_down)
+      pos.offset(0, 2, 0),
     ]
 
     await bot.equip(item, 'hand')
 
-    for (const target of candidates) {
+    // Helper: try to place at a target position
+    const dirs = [[0,-1,0],[0,1,0],[1,0,0],[-1,0,0],[0,0,1],[0,0,-1]]
+    const tryPlace = async (target) => {
       const targetBlock = bot.blockAt(target)
-      if (!targetBlock || targetBlock.name !== 'air') continue // need an empty space
+      if (!targetBlock || (targetBlock.name !== 'air' && targetBlock.name !== 'cave_air')) return false
 
-      // Find a solid reference block adjacent to the target position
-      const dirs = [[0,-1,0],[0,1,0],[1,0,0],[-1,0,0],[0,0,1],[0,0,-1]]
       for (const [dx, dy, dz] of dirs) {
         const refPos = target.offset(dx, dy, dz)
-        // Skip if reference is at bot's position (bot entity blocks placement)
-        if (refPos.x === botBlock.x && refPos.y === botBlock.y && refPos.z === botBlock.z) continue
+        // Skip if reference is at bot's body (feet or head)
+        if (refPos.x === botFeet.x && refPos.z === botFeet.z &&
+            (refPos.y === botFeet.y || refPos.y === botHead.y)) continue
         const refBlock = bot.blockAt(refPos)
         if (refBlock && refBlock.name !== 'air' && refBlock.name !== 'cave_air' && refBlock.boundingBox === 'block') {
           const faceVec = new Vec3(-dx, -dy, -dz)
           await bot.placeBlock(refBlock, faceVec)
           await new Promise(r => setTimeout(r, 100))
-          return res.json({ success: true, message: `Placed ${block_name} at ${target.x}, ${target.y}, ${target.z}` })
+          return true
         }
+      }
+      return false
+    }
+
+    // Phase 1: try all candidate positions
+    for (const target of candidates) {
+      if (await tryPlace(target)) {
+        return res.json({ success: true, message: `Placed ${block_name} at ${target.x}, ${target.y}, ${target.z}` })
+      }
+    }
+
+    // Phase 2: dig out an adjacent block to create space, then place there
+    const digTargets = [pos.offset(1,0,0), pos.offset(-1,0,0), pos.offset(0,0,1), pos.offset(0,0,-1)]
+    for (const target of digTargets) {
+      const block = bot.blockAt(target)
+      if (block && block.name !== 'air' && block.name !== 'cave_air' && block.name !== 'bedrock') {
+        try {
+          await bot.dig(block)
+          await new Promise(r => setTimeout(r, 100))
+          if (await tryPlace(target)) {
+            return res.json({ success: true, message: `Placed ${block_name} at ${target.x}, ${target.y}, ${target.z} (after digging)` })
+          }
+        } catch (e) { /* continue to next direction */ }
       }
     }
 

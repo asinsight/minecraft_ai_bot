@@ -831,8 +831,10 @@ class ChainExecutor:
                 return "Placed crafting_table from inventory"
             # Place failed — try digging a spot first, then place
             print(f"   ⚠️ place_block failed: {place_result.get('message', '')[:80]}")
-            # Dig the block in front of bot to make space, then place on it
-            call_tool("mine_block", {"block_type": "dirt", "count": 1})
+            # Dig adjacent block to create space (stone underground, dirt on surface)
+            mine_result = call_tool("mine_block", {"block_type": "stone", "count": 1})
+            if not mine_result.get("success"):
+                call_tool("mine_block", {"block_type": "dirt", "count": 1})
             place_result = call_tool("place_block", {"block_name": "crafting_table"})
             if place_result.get("success"):
                 return "Placed crafting_table (after clearing space)"
@@ -871,8 +873,17 @@ class ChainExecutor:
     def _ensure_furnace(self, inventory: dict) -> Optional[str]:
         """Make sure a furnace is placed nearby. Returns status message or None."""
         if inventory.get("furnace", 0) > 0:
-            call_tool("place_block", {"block_name": "furnace"})
-            return "Placed furnace from inventory"
+            place_result = call_tool("place_block", {"block_name": "furnace"})
+            if place_result.get("success"):
+                return "Placed furnace from inventory"
+            # Place failed — clear space and retry
+            print(f"   ⚠️ furnace place failed: {place_result.get('message', '')[:80]}")
+            mine_result = call_tool("mine_block", {"block_type": "stone", "count": 1})
+            if not mine_result.get("success"):
+                call_tool("mine_block", {"block_type": "dirt", "count": 1})
+            place_result = call_tool("place_block", {"block_name": "furnace"})
+            if place_result.get("success"):
+                return "Placed furnace (after clearing space)"
 
         find_result = call_tool("find_block", {"block_type": "furnace", "max_distance": 32})
         if find_result.get("success"):
@@ -884,7 +895,13 @@ class ChainExecutor:
             if not ct_nearby.get("success"):
                 self._ensure_crafting_table(inventory)
             call_tool("craft_item", {"item_name": "furnace"})
-            call_tool("place_block", {"block_name": "furnace"})
+            place_result = call_tool("place_block", {"block_name": "furnace"})
+            if not place_result.get("success"):
+                # Clear space and retry
+                mine_result = call_tool("mine_block", {"block_type": "stone", "count": 1})
+                if not mine_result.get("success"):
+                    call_tool("mine_block", {"block_type": "dirt", "count": 1})
+                call_tool("place_block", {"block_name": "furnace"})
             return "Crafted + placed furnace"
 
         return None

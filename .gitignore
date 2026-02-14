@@ -1,1 +1,6 @@
 .env
+*.json
+node_modules/
+__pycache__/
+.claude/
+*.log

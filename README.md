@@ -1,4 +1,4 @@
-# Minecraft Autonomous AI Bot (v6.3 — Dual LLM + Chain of Action)
+# Minecraft Autonomous AI Bot (v6.4 — Log Analysis + Underground Fix)
 
 An autonomous Minecraft bot that sets a grand objective (like defeating the Ender Dragon) and **executes most actions without LLM calls** — using hardcoded action chains for known tasks, experience memory for learned solutions, and LLM only for high-level planning decisions.
 
@@ -25,7 +25,7 @@ An autonomous Minecraft bot that sets a grand objective (like defeating the Ende
 |    - Shelter: build (surface, with door)            |
 |               or dig (underground, sealed)          |
 |    - Directional mining (staircase, tunnel)        |
-|    - Block placement (6-dir search, safe position) |
+|    - Block placement (9-pos + dig-out fallback)     |
 |    - Smart pathfinding (auto-mine obstacles)       |
 |    - Item/block search via minecraft-data          |
 +--------------------------------------------------+
@@ -57,6 +57,11 @@ An autonomous Minecraft bot that sets a grand objective (like defeating the Ende
 |      |   Player conversations -> Claude Sonnet     |
 |      |   - Can change goals/chains via tools       |
 |      |   - Falls back to local LLM if unavailable  |
+|      |                                             |
+|      +-- Log Analysis -- Auto-save + analyzer      |
+|      |   TeeLogger -> logs/bot_*.log               |
+|      |   analyze_logs.py -> report.md              |
+|      |   CLAUDE.md -> Claude Code auto-context     |
 |      |                                             |
 |      +-- Grand Goal --- Dependency graph           |
 |      |   grand_goal.py    Auto-inventory checks    |
@@ -385,18 +390,27 @@ The bot automatically equips the best available gear at key moments:
 
 **Tier priority** (high → low): Diamond > Iron > Chainmail > Leather. Old gear returns to inventory automatically.
 
-### Block Placement (6-Direction Safe Placement)
+### Block Placement (9-Position + Dig-Out Fallback)
 
 ```
 place_block("crafting_table")
-  +- Find air block adjacent to bot (not where bot stands)
-  +- Search 6 directions from target for solid reference block
-  +- Skip bot's own position as reference
-  +- Calculate correct face vector
-  +- Place block + 100ms server delay
-  +- Underground? No air? -> mine adjacent block to create space -> retry
+  |
+  +- Phase 1: Try 9 candidate positions around bot
+  |     Priority 1: feet-level horizontal (4 dirs) — works on surface
+  |     Priority 2: head-level horizontal (4 dirs) — works in caves
+  |     Priority 3: above head (1 pos) — works in vertical shafts
+  |     For each: find air block -> find solid reference -> calculate face vector -> place
+  |     Skip bot's feet + head positions as reference
+  |
+  +- Phase 2: Dig-out fallback (if all 9 positions fail)
+  |     Pick adjacent solid block (not bedrock) -> dig it -> creates air space
+  |     Try placing at newly cleared position
+  |
+  +- 100ms server delay after placement
   +- Auto-save location to spatial memory (crafting_table, furnace, etc.)
 ```
+
+**Why 9 positions?** After `dig_down`, bot is in a 1x1 vertical shaft — all 4 horizontal blocks at feet level are stone. But head-level or above-head positions may have air from the shaft the bot dug through.
 
 ### Smart Pathfinding (Auto-Mine Obstacles)
 
@@ -429,6 +443,46 @@ KNOWN LOCATIONS (6):
 ```
 
 **Auto-saved** (Layer 1 + Layer 2): crafting table, chest, furnace, bed, shelter.
+
+---
+
+## Log Analysis System
+
+All bot output is automatically saved to `logs/bot_YYYYMMDD_HHMMSS.log` via TeeLogger. Use the analyzer to generate reports for Claude Code diagnosis.
+
+### Workflow
+
+```
+1. Run bot          python agent.py              → logs/bot_*.log (auto)
+2. Analyze          python analyze_logs.py       → report.md
+3. Claude Code      Read report.md               → diagnose issues
+4. Deep dive        Read specific tick range      → identify root cause
+5. Fix              Edit code based on analysis   → re-run bot
+```
+
+### Analyzer Features
+
+```bash
+python analyze_logs.py                    # Most recent log
+python analyze_logs.py logs/bot_xxx.log   # Specific log
+python analyze_logs.py --last 500         # Last 500 ticks only
+```
+
+**Report includes:**
+- **Chain Performance**: success/fail/avg ticks per chain
+- **Top Errors**: most frequent error messages with count
+- **Stuck Loops**: consecutive identical steps (wasted ticks)
+- **LLM Escalations**: why and when LLM was called
+- **Deaths**: death events with tick numbers
+- **Recommendations**: auto-generated fix suggestions mapped to code locations
+
+### CLAUDE.md (Auto-Context)
+
+`CLAUDE.md` at project root is automatically read by Claude Code on session start. Contains:
+- Architecture overview, key files, data files
+- Log analysis workflow (4-step)
+- Common issues → fix locations table
+- REST API endpoint list
 
 ---
 
@@ -488,6 +542,8 @@ Build: crafting_table + build_shelter (with door) + place_furnace + place_chest
 | Death lessons | `death_lessons.json` | Yes |
 | Saved locations | `waypoints.json` | Yes |
 | Experience memory (search + error solutions) | `experience.json` | Yes |
+| Bot execution logs | `logs/bot_*.log` | Yes |
+| Analysis report | `report.md` | Yes (overwritten) |
 | Active chain state | in-memory | No (auto-restarts) |
 
 ---
@@ -576,10 +632,15 @@ minecraft-bot/
 +-- spatial_memory.py      # Named waypoint storage (max 3 shelters)
 +-- memory_tools.py        # LangChain tools for location memory
 |
++-- analyze_logs.py       # Log analyzer -> report.md
++-- CLAUDE.md             # Claude Code auto-context (project guide)
+|
 +-- grand_goal_state.json  # [Auto] Saved goal progress
 +-- death_lessons.json     # [Auto] Persistent death lessons
 +-- waypoints.json         # [Auto] Persistent saved locations
 +-- experience.json        # [Auto] Persistent experience data
++-- report.md              # [Auto] Latest analysis report
++-- logs/                  # [Auto] Bot execution logs
 |
 +-- .env                   # Configuration
 +-- package.json           # Node.js dependencies
@@ -588,9 +649,9 @@ minecraft-bot/
 
 ---
 
-## Performance: v3 vs v6.3
+## Performance: v3 vs v6.4
 
-| Metric | v3 (LLM every tick) | v6.3 (Dual LLM + Chain) |
+| Metric | v3 (LLM every tick) | v6.4 (Dual LLM + Chain) |
 |--------|--------------------|--------------------|
 | LLM calls per minute | ~12 | ~0.3 |
 | Time per action | 5-15s (LLM thinking) | 1-2s (direct API) |
@@ -647,6 +708,10 @@ minecraft-bot/
 - [x] **Skipped task retry system (up to 2 retries after other tasks complete)**
 - [x] **3-phase resource search (static → persistent → LLM escalation)**
 - [x] **Persistent search mode (8 dynamic explore/dig attempts before LLM)**
+- [x] **9-position block placement + dig-out fallback (underground fix)**
+- [x] **TeeLogger — auto-save all output to logs/bot_*.log**
+- [x] **Log analyzer (analyze_logs.py) — chain stats, error patterns, stuck loops, recommendations**
+- [x] **CLAUDE.md — Claude Code auto-context for project analysis**
 - [ ] Nether navigation + portal building
 - [ ] Chest inventory management
 - [ ] Dynamic chain generation by LLM
@@ -655,4 +720,4 @@ minecraft-bot/
 
 **Author**: Jun
 **Created**: 2026-02-13
-**Version**: v6.3 -- Dual LLM + Chain of Action + Auto-Equip + Persistent Search
+**Version**: v6.4 -- Log Analysis + Underground Block Placement Fix
