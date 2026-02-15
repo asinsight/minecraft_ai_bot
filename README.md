@@ -1,4 +1,4 @@
-# Minecraft Autonomous AI Bot (v6.5 — Water/Drowning Survival)
+# Minecraft Autonomous AI Bot (v6.8 — Abort Mechanism)
 
 An autonomous Minecraft bot that sets a grand objective (like defeating the Ender Dragon) and **executes most actions without LLM calls** — using hardcoded action chains for known tasks, experience memory for learned solutions, and LLM only for high-level planning decisions.
 
@@ -95,7 +95,7 @@ An autonomous Minecraft bot that sets a grand objective (like defeating the Ende
 | **Action Planning** | Local LLM (Qwen3) | Chain fails, chain done, death, no goal | Fast, free, good enough for chain selection |
 | **Player Chat** | Claude API (Sonnet) | Player sends message | Natural language understanding, multilingual, can modify bot behavior |
 
-**Player chat can influence actions**: When a player says "go mine diamonds", Claude understands and calls `choose_next_chain("mine_diamonds")` or `set_grand_goal("defeat_ender_dragon")`.
+**Player chat can influence actions**: When a player says "go mine diamonds", Claude understands and calls `choose_next_chain("mine_diamonds")` or `set_grand_goal("defeat_ender_dragon")`. Players can also request entirely custom goals like "build a big house" — Claude triggers `request_custom_goal()`, and the planning LLM dynamically creates tasks from available chains.
 
 **Automatic fallback**: If `ANTHROPIC_API_KEY` is not set or Claude fails, player chat falls back to the local LLM.
 
@@ -122,16 +122,21 @@ Immediate survival reactions. Checked every tick before anything else.
 
 ```
 HP < 5 + has food     -> eat_food()           instant
+HP < 5 + under attack -> flee()               instant
 HP < 5 + no food      -> dig_shelter()        instant (sealed with blocks)
 In water + O2 <= 12   -> escape_water()       instant (swim up + find land)
 In water + O2 <= 5    -> escape_water()       instant (critical drowning)
   (turtle_helmet      -> auto-equip, threshold lowered to O2 <= 5)
-Creeper within 5m     -> dig_shelter()        instant
-Warden detected       -> dig_shelter()        instant
+Sudden HP drop (>=4)  -> fight/flee           instant (based on threat rec)
+Under attack          -> fight/flee/avoid     instant (based on threat rec)
+Creeper within 5m     -> flee()               instant (faster than shelter)
+Warden detected       -> flee()               instant
+Flee recommendation   -> flee() or shelter    instant
+Fight/fight_careful   -> attack nearest       instant (if hostile within 8m)
+Avoid recommendation  -> flee()               instant (if hostile within 6m)
 Night + surface       -> dig_shelter()        instant
 Dusk + surface        -> dig_shelter()        instant
 Hungry (food < 5)     -> eat_food()           instant
-Flee recommendation   -> dig_shelter()        instant
 Mob inside shelter    -> attack_entity()      instant
 ```
 
@@ -199,7 +204,7 @@ Player: "Can you mine diamonds instead?"
   +-- Claude calls: send_chat("Sure! Heading to diamond level")
 ```
 
-**Available Claude tools**: `send_chat`, `set_grand_goal`, `choose_next_chain`, `skip_grand_task`, `complete_grand_task`, `get_grand_goal_status`
+**Available Claude tools**: `send_chat`, `set_grand_goal`, `choose_next_chain`, `skip_grand_task`, `complete_grand_task`, `get_grand_goal_status`, `request_custom_goal`
 
 ### Learning Loop: LLM Solutions -> Experience Memory
 
@@ -395,10 +400,51 @@ GET /threat_assessment
 | `safe` | No threats, continue chain |
 | `fight` | Strong advantage -- engage (Layer 0 handles) |
 | `fight_careful` | Watch health, eat mid-fight |
-| `avoid` | Don't engage -- continue task, watch distance |
-| `flee` | dig_shelter immediately (Layer 0 instinct) |
+| `avoid` | Don't engage -- flee if hostile within 6m |
+| `flee` | flee() immediately, shelter as fallback |
 
 **During combat**: auto-equip best weapon, chase target, eat if HP < 8, flee if HP <= 4, avoid creepers, run from Wardens, collect drops.
+
+### Real-Time Attack Detection (v6.6)
+
+```
+bot.on('health') -> HP decreased?
+  |
+  +- Identify attacker (nearest hostile mob)
+  +- Update combatState: attacker, damage, timestamp
+  +- Track recent attacks (last 10)
+  +- Auto-clear after 5 seconds of no hits
+  |
+GET /combat_status -> { isUnderAttack, lastAttacker, healthDelta, recentAttacks }
+  |
+check_instinct (every tick):
+  +- Under attack? -> auto-equip weapon -> fight/flee/avoid (based on rec)
+  +- HP dropped >= 4 in one tick? -> emergency response
+  +- Chain running? -> interrupt chain, let instinct handle next tick
+```
+
+**Chain interruption**: When attacked during a chain, execution pauses. Instinct handles the threat. Chain resumes automatically after combat ends.
+
+### Combat Experience Memory
+
+The bot remembers combat outcomes and learns from them:
+
+```
+record_combat(mob, outcome, position, damage, weapon, armor, time_of_day)
+  -> experience.json (persistent, last 30 encounters)
+
+get_combat_summary() -> "zombie: 3W/1F/0D (avg dmg: 4)"
+get_dangerous_area(position) -> "DANGER ZONE: Died 2x nearby (mobs: skeleton)"
+```
+
+| Data Tracked | Purpose |
+|-------------|---------|
+| Mob type + outcome (won/fled/died) | Win rate per mob type |
+| Damage taken + weapon used | Assess readiness |
+| Position + time of day | Identify danger zones |
+| Armor equipped | Correlate gear with survival |
+
+**LLM context**: Combat summary and threat status are included in LLM planning calls for better decision-making.
 
 ### Auto-Equip Best Gear
 
@@ -447,6 +493,27 @@ move_to(x, y, z) FAILED: "Path blocked"
   +- 5. Chain_executor -> immediate LLM escalation (no 3x retry)
         -> LLM picks alternate route or strategy
 ```
+
+### Abort Mechanism (v6.8)
+
+Long-running server actions (mining 32 blocks, digging tunnels) can outlive the Python HTTP timeout. Previously this caused pathfinder collisions and infinite retry loops.
+
+```
+Python call_tool("mine_block", count=32, timeout=256s)
+  |
+  +- timeout! (requests.exceptions.ReadTimeout)
+  |
+  +- call_tool detects "timed out" in error
+  +- abort_bot_action() -> POST /abort
+  |     -> server.js: abortFlag = true + pathfinder.setGoal(null)
+  |     -> mine loop checks abortFlag at next iteration -> stops cleanly
+  +- sleep(1.5s) for cleanup
+  +- return {success: false, message: "Timeout: ...aborted"}
+  |
+Next API call is safe (no pathfinder conflict)
+```
+
+**Abort checks in**: `/action/mine`, `/action/dig_down`, `/action/dig_tunnel`, `/action/build_shelter`
 
 ### Spatial Memory
 
@@ -509,9 +576,34 @@ python analyze_logs.py --last 500         # Last 500 ticks only
 
 ---
 
-## Grand Goals Available
+## Grand Goals: Dynamic Goal Library (v6.7)
 
-### Defeat the Ender Dragon (25 tasks, 6 phases)
+Goals are stored in `goal_library.json` (file-based, persistent). The bot ships with 3 built-in goals, but players can request custom goals via chat, and the LLM can create new ones dynamically.
+
+### How Custom Goals Work
+
+```
+Player: "Build a big house"
+  |
+  +-- Claude (Chat Agent): request_custom_goal("Build a big house")
+  +-- _pending_goal_request set
+  |
+Next tick:
+  +-- Planning LLM: find_similar_goals("Build a big house")
+  |     -> Found "cozy_base"? -> set_grand_goal("cozy_base")
+  |     -> Not found? -> create_custom_grand_goal(name, tasks_json, ...)
+  |           -> Validates chain_names -> Saves to goal_library.json
+  |           -> Goal activated with user_requested=True (priority)
+  |
+Goal completes:
+  +-- user_requested reset -> LLM auto-selects next from library
+```
+
+**Priority**: User-requested goals always take priority. Auto-selected goals won't override a user request.
+
+### Built-in Goals (3)
+
+#### Defeat the Ender Dragon (24 tasks, 6 phases)
 
 ```
 Phase 1: Basic Survival
@@ -530,16 +622,20 @@ Phase 4-6: Nether -> Ender -> End
   diamond_sword --> endermen +---> eyes --> stronghold --> portal --> dragon
 ```
 
-### Full Iron Gear (8 tasks, 2 phases)
+#### Full Iron Gear (8 tasks, 2 phases)
 ```
 get_wood -> crafting_table -> wooden_pick -> stone_pick -> iron_pick + iron_sword + iron_armor + shield
 ```
 
-### Cozy Base (6 tasks, 2 phases)
+#### Cozy Base (6 tasks, 2 phases)
 ```
 Gather: get_wood, mine_stone (dedicated mining, no shelter building)
 Build: crafting_table + build_shelter (with door) + place_furnace + place_chest
 ```
+
+### LLM-Created Goals
+
+The planning LLM can create new goals using any combination of 17 available chains. Created goals are validated (valid chain names, no circular dependencies, no duplicate IDs) and saved to `goal_library.json` for future reuse.
 
 ---
 
@@ -555,6 +651,8 @@ Build: crafting_table + build_shelter (with door) + place_furnace + place_chest
 | Survival | `find_food` |
 | Emergency | `emergency_eat`, `emergency_shelter`, `emergency_flee` |
 
+**17 chains valid for goal tasks** (used by `create_custom_grand_goal`): `get_wood`, `mine_stone`, `make_crafting_table`, `make_wooden_pickaxe`, `make_stone_pickaxe`, `make_iron_pickaxe`, `make_iron_sword`, `make_iron_armor`, `make_shield`, `make_bucket`, `mine_diamonds`, `make_diamond_pickaxe`, `make_diamond_sword`, `find_food`, `build_shelter`, `place_furnace`, `place_chest`
+
 ---
 
 ## Persistence (Survives Restarts)
@@ -562,9 +660,10 @@ Build: crafting_table + build_shelter (with door) + place_furnace + place_chest
 | Data | File | Survives restart? |
 |------|------|:-:|
 | Grand goal progress | `grand_goal_state.json` | Yes |
+| Goal library (built-in + custom goals) | `goal_library.json` | Yes |
 | Death lessons | `death_lessons.json` | Yes |
 | Saved locations | `waypoints.json` | Yes |
-| Experience memory (search + error solutions) | `experience.json` | Yes |
+| Experience memory (search + errors + combat) | `experience.json` | Yes |
 | Bot execution logs | `logs/bot_*.log` | Yes |
 | Analysis report | `report.md` | Yes (overwritten) |
 | Active chain state | in-memory | No (auto-restarts) |
@@ -615,7 +714,7 @@ ANTHROPIC_API_KEY=sk-ant-...
 
 # Agent
 TICK_INTERVAL=3
-MAX_ITERATIONS=5
+MAX_ITERATIONS=20
 ```
 
 ## Running
@@ -642,12 +741,12 @@ minecraft-bot/
 +-- agent.py               # [Python] Main 3-layer tick loop + dual LLM routing
 +-- chain_library.py       # Hardcoded action chains + search strategies (20 chains)
 +-- chain_executor.py      # Layer 0+1 execution engine + auto-fix + experience check
-+-- experience_memory.py   # Remember what worked (search successes, LLM error fixes)
++-- experience_memory.py   # Remember what worked (search, errors, combat encounters)
 |
 +-- tools.py               # 29 LangChain tools (for LLM Layer 2 only)
 |
-+-- grand_goal.py          # Grand goal dependency graph + auto-inventory checks
-+-- grand_goal_tools.py    # LangChain tools for goal management
++-- grand_goal.py          # Grand goal dependency graph + GoalLibrary (file-based)
++-- grand_goal_tools.py    # LangChain tools for goal management (legacy)
 |
 +-- death_analyzer.py      # Death snapshot capture + lesson extraction
 +-- death_tools.py         # LangChain tools for death learning
@@ -659,6 +758,7 @@ minecraft-bot/
 +-- CLAUDE.md             # Claude Code auto-context (project guide)
 |
 +-- grand_goal_state.json  # [Auto] Saved goal progress
++-- goal_library.json      # [Auto] Goal library (3 built-in + custom goals)
 +-- death_lessons.json     # [Auto] Persistent death lessons
 +-- waypoints.json         # [Auto] Persistent saved locations
 +-- experience.json        # [Auto] Persistent experience data
@@ -672,9 +772,9 @@ minecraft-bot/
 
 ---
 
-## Performance: v3 vs v6.4
+## Performance: v3 vs v6.8
 
-| Metric | v3 (LLM every tick) | v6.4 (Dual LLM + Chain) |
+| Metric | v3 (LLM every tick) | v6.8 (Dual LLM + Chain) |
 |--------|--------------------|--------------------|
 | LLM calls per minute | ~12 | ~0.3 |
 | Time per action | 5-15s (LLM thinking) | 1-2s (direct API) |
@@ -687,6 +787,8 @@ minecraft-bot/
 | Player chat | Same slow LLM | Claude API (fast, natural) |
 | Failed tasks | Stuck forever | Skip → retry later (up to 2 retries) |
 | Gear management | Manual | Auto-equip best gear at key moments |
+| Combat response | None | Real-time attack detect → fight/flee/avoid |
+| Combat memory | None | Record outcomes, track danger zones |
 
 ---
 
@@ -736,12 +838,18 @@ minecraft-bot/
 - [x] **Log analyzer (analyze_logs.py) — chain stats, error patterns, stuck loops, recommendations**
 - [x] **CLAUDE.md — Claude Code auto-context for project analysis**
 - [x] **Water/Drowning survival — oxygen monitoring, 3-phase escape, turtle helmet support**
+- [x] **Combat response system — real-time attack detection, fight/flee/avoid, chain interruption**
+- [x] **Combat experience memory — record outcomes, danger zones, LLM context enrichment**
+- [x] **Flee action — sprint away from threats (separate from shelter)**
+- [x] **Real death message capture — actual Minecraft death messages instead of hardcoded**
+- [x] **Dynamic Grand Goal system — file-based GoalLibrary, user chat -> custom goals, LLM creates tasks**
+- [x] **Goal priority system — user-requested goals override auto-selected goals**
+- [x] **Abort mechanism — Python timeout -> POST /abort -> server stops long-running loops cleanly**
 - [ ] Nether navigation + portal building
 - [ ] Chest inventory management
-- [ ] Dynamic chain generation by LLM
 
 ---
 
 **Author**: Jun
 **Created**: 2026-02-13
-**Version**: v6.5 -- Water/Drowning Survival System
+**Version**: v6.8 -- Abort Mechanism

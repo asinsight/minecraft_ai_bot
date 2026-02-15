@@ -1,4 +1,4 @@
-# Minecraft Autonomous Bot v6.5
+# Minecraft Autonomous Bot v6.8
 
 ## Architecture
 
@@ -21,13 +21,13 @@ Python (agent.py)  ←REST API (localhost:3001)→  Node.js (server.js / Minefla
 | File | Role |
 |------|------|
 | `agent.py` | 메인 3초 틱 루프, 3-Layer 실행, LLM 호출, TeeLogger (로그 자동 저장) |
-| `chain_executor.py` | Chain 실행 엔진, auto-fix, 3-phase 검색 전략, 자동 장비, prerequisite injection |
+| `chain_executor.py` | Chain 실행 엔진, auto-fix, 3-phase 검색 전략, 자동 장비, prerequisite injection, abort on timeout |
 | `chain_library.py` | 20개 행동 체인 정의 + SEARCH_STRATEGIES + 체인별 completion_items |
-| `grand_goal.py` | Goal/Task 의존성 그래프, 자동 완료 감지, skipped task retry |
-| `grand_goal_tools.py` | LangChain 도구 (goal 관리) |
+| `grand_goal.py` | GoalLibrary (파일 기반) + Goal/Task 의존성 그래프, 자동 완료 감지, 동적 goal 생성 |
+| `grand_goal_tools.py` | LangChain 도구 (goal 관리) — legacy, 도구는 agent.py에 inline 정의됨 |
 | `goal_planner.py` | Task 우선순위 + step 상태 추적 |
-| `server.js` | Mineflayer bot + Express REST API (20+ endpoints), 전투 AI, pathfinding |
-| `experience_memory.py` | 검색 성공/LLM 솔루션 기억 → experience.json |
+| `server.js` | Mineflayer bot + Express REST API (20+ endpoints), 전투 AI, pathfinding, abort 메커니즘 |
+| `experience_memory.py` | 검색 성공/LLM 솔루션/전투 경험 기억 → experience.json |
 | `spatial_memory.py` | 위치 기억 (쉘터 max 3, crafting_table, furnace) → waypoints.json |
 | `death_analyzer.py` | 죽음 스냅샷 캡처 + 교훈 추출 → death_lessons.json |
 | `death_tools.py` | LangChain 도구 (죽음 분석) |
@@ -39,7 +39,8 @@ Python (agent.py)  ←REST API (localhost:3001)→  Node.js (server.js / Minefla
 
 | File | Content | 재시작 후 유지 |
 |------|---------|:-:|
-| `grand_goal_state.json` | 현재 goal 진행 상태 + skip_retry_count | Yes |
+| `grand_goal_state.json` | 현재 goal 진행 상태 + skip_retry_count + user_requested | Yes |
+| `goal_library.json` | Goal 라이브러리 (built-in 3개 + 커스텀 goals) | Yes |
 | `experience.json` | 학습된 검색 방법 + LLM 에러 솔루션 | Yes |
 | `waypoints.json` | 저장된 위치 (쉘터, crafting_table, furnace) | Yes |
 | `death_lessons.json` | 죽음 교훈 | Yes |
@@ -89,6 +90,12 @@ report에서 문제 tick 범위를 찾았으면, 원본 로그 파일에서 해�
 | move_to 경로 차단 | `server.js` `/action/move` + `chain_executor.py` | 장애물 자동 채굴 → 즉시 LLM escalation |
 | skipped task 미재시도 | `grand_goal.py` `pick_next_task` | MAX_SKIP_RETRIES, skip_retry_count 확인 |
 | 익사/물 빠짐 | `chain_executor.py` `check_instinct` + `server.js` `/action/escape_water` | Layer 0: oxygen ≤ 12 → escape_water, Layer 1: oxygen < 10 → 체인 중단 후 탈출 |
+| 몹 공격 무반응 | `chain_executor.py` `check_instinct` + `server.js` `combatState` | 실시간 공격 감지 → fight/flee/avoid 즉시 반응, 체인 자동 중단 |
+| 전투 경험 미기억 | `experience_memory.py` `record_combat` | 전투 결과 (승리/도주/사망) + 위치 + 장비 기억, 위험 지역 감지 |
+| HTTP timeout → 서버 루프 안 멈춤 | `chain_executor.py` `call_tool` + `server.js` `/abort` | timeout 감지 → POST /abort → abortFlag → 루프 중단 |
+| pathfinder 충돌 에러 | `server.js` abortFlag 체크 + `chain_executor.py` abort_bot_action | "goal was changed" 에러 → abort로 선행 작업 정리 |
+| 커스텀 goal 생성 실패 | `grand_goal.py` `GoalLibrary._validate_goal` | chain_name 유효성, 중복 id, 순환 의존성 검사 |
+| goal_library.json 손상 | `grand_goal.py` `GoalLibrary._load` | corruption 시 built-in 3개로 자동 re-seed |
 
 ---
 
@@ -99,13 +106,15 @@ report에서 문제 tick 범위를 찾았으면, 원본 로그 파일에서 해�
 1. state, threat 가져오기 (GET /status, /threat_assessment)
 2. auto_check_progress (인벤토리 스캔 → task 자동 완료)
 3. auto_equip_best_gear (chain 시작 시)
-4. Layer 0: check_instinct → HP 낮음? 물? 밤? 크리퍼? → 즉시 실행, return
+4. Layer 0: check_instinct → HP 낮음? 물? 공격받음? 전투? 밤? → 즉시 실행, return
 5. death 체크 → 죽었으면 LLM 분석
-6. player chat → 있으면 Claude API 응답
-7. Layer 1: chain active? → execute_tick()
+6. player chat → 있으면 Claude API 응답 (request_custom_goal 가능)
+7. pending goal 체크 → _pending_goal_request 있으면 LLM에 goal 생성 요청, return
+8. Layer 1: chain active? → execute_tick()
    - needs_llm이면 escalation → LLM 솔루션 캡처 → experience.json 저장
-8. Layer 2: chain 없음
-   - goal 없으면 LLM에 goal 설정 요청
+   - timeout 시 abort_bot_action() → 서버 루프 중단
+9. Layer 2: chain 없음
+   - goal 없으면 저장된 goal 목록 표시 → LLM이 선택 or 생성
    - task 있고 chain 있으면 auto-start (LLM 없이!)
    - task 없거나 chain 없으면 LLM 호출
 ```
@@ -160,6 +169,60 @@ Phase 1: 9개 후보 위치 시도
 Phase 2: dig-out fallback — 인접 블록 dig → air 생성 → 배치
 ```
 
+### Combat Response Flow (check_instinct)
+```
+우선순위 (높은 순):
+1. Critical HP (< 5) → 먹기/flee(공격중)/셸터
+2. 익사 위험 (oxygen ≤ 12) → escape_water
+3. 갑작스런 HP 감소 (≥ 4) → fight or flee (권고 기반)
+4. 공격받는 중 (combatState) → fight/flee/avoid (권고 기반)
+5. Creeper 근접 → flee (shelter보다 빠름)
+6. Warden → flee
+7. Flee 권고 → flee (실패 시 shelter)
+8. Fight/fight_careful 권고 → 8m 내 적 선제 공격
+9. Avoid 권고 → 6m 내 접근 시 flee
+10. 밤/황혼 → shelter
+11. 배고픔 → eat
+12. 쉘터 안 몹 → attack
+```
+
+### Combat State Tracking (server.js)
+```
+bot.on('health') → 체력 감소 감지 → 가장 가까운 적 식별
+  → combatState 업데이트 (공격자, 피해량, 시간)
+  → recentAttacks 배열 (최근 10회)
+  → 5초 후 자동 해제 (공격 멈추면)
+
+GET /combat_status → 전투 상태 + 추천 반응 반환
+```
+
+### Abort Mechanism (Python ↔ Node.js)
+```
+call_tool() timeout 발생 → "timed out" 감지
+  → abort_bot_action() → POST /abort → abortFlag = true
+  → bot.pathfinder.setGoal(null) (진행 중 pathfinding 즉시 중단)
+  → 서버 루프 (mine/dig_down/dig_tunnel/build_shelter) 다음 iteration에서 체크 → 종료
+  → Python 1.5초 대기 (서버 정리 시간)
+  → 다음 API 요청 안전하게 실행
+```
+
+### Dynamic Grand Goal System (GoalLibrary)
+```
+goal_library.json — 파일 기반 goal 저장소
+  ├── 3개 built-in goals (첫 실행 시 자동 생성)
+  ├── LLM이 create_custom_grand_goal()로 추가한 goals
+  └── 검증: chain_name 유효성, 중복 id, 순환 의존성
+
+유저 채팅 → request_custom_goal(desc) → _pending_goal_request
+  → 다음 tick: find_similar_goals() → 유사 goal 있으면 재사용
+  → 없으면: create_custom_grand_goal() → 검증 → 저장 → 활성화
+
+user_requested 플래그:
+  - True: 유저 요청 goal → 자동 선택으로 덮어쓰기 불가
+  - False: LLM 자동 선택 → 유저 요청 시 교체 가능
+  - goal 완료 시 False로 리셋 → 다음에 자동 선택 가능
+```
+
 ### Auto-Equip Best Gear
 ```
 호출 시점: chain 시작, chain 완료, 전투 전 (chain + instinct), mine_block 전
@@ -173,14 +236,18 @@ Slots: head, torso, legs, feet, hand (sword), off-hand (shield)
 ## REST API Endpoints (server.js)
 
 **Info**:
-- GET `/status` — 봇 상태 (위치, HP, 인벤토리, 시간)
+- GET `/status` — 봇 상태 (위치, HP, 인벤토리, 시간, 물/전투 상태)
 - GET `/inventory` — 인벤토리 목록
 - GET `/equipment` — 장착 장비
 - GET `/nearby_blocks` — 주변 블록
-- GET `/threat_assessment` — 위협 평가
+- GET `/threat_assessment` — 위협 평가 (playerPower vs totalDanger → 권고)
+- GET `/combat_status` — 실시간 전투 상태 (공격 감지, 최근 공격, 공격자 정보)
+
+**Control**:
+- POST `/abort` — 진행 중인 장시간 작업 중단 (abortFlag 설정 + pathfinder 중지)
 
 **Actions**:
-- POST `/action/mine` — 블록 채굴 `{block_type, count}`
+- POST `/action/mine` — 블록 채굴 `{block_type, count}` (abort 체크 포함)
 - POST `/action/craft` — 아이템 제작 `{item_name, count}`
 - POST `/action/smelt` — 제련 `{item_name, count, fuel}`
 - POST `/action/place` — 블록 배치 `{block_name, x?, y?, z?}` (9-pos + dig-out)
@@ -188,6 +255,8 @@ Slots: head, torso, legs, feet, hand (sword), off-hand (shield)
 - POST `/action/eat` — 음식 먹기
 - POST `/action/attack` — 공격 `{entity_name}` (스마트 전투 AI)
 - POST `/action/move` — 이동 `{x, y, z}` (장애물 자동 채굴)
+- POST `/action/flee` — 도주 (위협 반대 방향으로 스프린트 이동)
+- POST `/action/escape_water` — 물 탈출 (3-phase: 수영상승 → 육지이동 → 블록배치)
 
 **Search**:
 - POST `/action/find_block` — 블록 찾기 `{block_type, max_distance}`
@@ -199,7 +268,6 @@ Slots: head, torso, legs, feet, hand (sword), off-hand (shield)
 - POST `/action/bridge` — 다리 건설
 - POST `/action/build_shelter` — 지상 셸터 (5x3x5 + 문)
 - POST `/action/dig_shelter` — 긴급 지하 셸터 (봉인)
-- POST `/action/escape_water` — 물 탈출 (3-phase: 수영상승 → 육지이동 → 블록배치)
 - POST `/action/explore` — 탐험 `{distance}`
 - POST `/action/seal_mineshaft` — 수직 갱도 봉인
 
@@ -211,7 +279,37 @@ Slots: head, torso, legs, feet, hand (sword), off-hand (shield)
 
 ## Version History
 
-### v6.5 (current)
+### v6.8 (current)
+- Abort 메커니즘: Python timeout 시 POST /abort → 서버 루프 즉시 중단
+- abortFlag 체크: /action/mine, dig_down, dig_tunnel, build_shelter 루프에 삽입
+- call_tool() timeout 감지 → abort_bot_action() 자동 호출 + 1.5초 정리 대기
+- pathfinder 충돌 방지: abort 시 bot.pathfinder.setGoal(null) 즉시 호출
+
+### v6.7
+- Dynamic Grand Goal System: 파일 기반 GoalLibrary (goal_library.json)
+- 하드코딩 GRAND_GOAL_REGISTRY 제거 → GoalLibrary._seed_builtin_goals()로 대체
+- 유저 채팅 → request_custom_goal() → Planning LLM이 goal 동적 생성
+- find_similar_goals(): 저장된 goal에서 유사 검색 → 재사용
+- create_custom_grand_goal(): 새 goal 생성 + chain_name 검증 + 순환 의존성 검사
+- user_requested 플래그: 유저 요청 goal > 자동 선택 goal 우선순위
+- max_tokens 500→2000 (goal 생성 시 긴 JSON 출력 지원)
+- MAX_ITERATIONS=20 (goal 생성에 충분한 LLM 호출 횟수)
+- Windows UTF-8 콘솔 인코딩 수정 (이모지 출력 에러 방지)
+
+### v6.6
+- 실시간 공격 감지: bot.on('health') 체력 변화 → combatState 추적 (공격자, 피해량, 최근 공격 목록)
+- GET /combat_status 엔드포인트: 전투 상태 실시간 조회
+- POST /action/flee 엔드포인트: 위협 반대 방향으로 스프린트 도주
+- check_instinct 전투 반응: 공격받으면 fight/flee/avoid 즉시 반응 (권고 기반)
+- 체력 변화 감지: 틱 간 HP 감소 → 위협 인식 (갑작스런 4+ HP 감소 시 긴급 대응)
+- 체인 실행 중 전투 중단: isUnderAttack + 2초 이내 → 체인 일시중단, 본능 반응 우선
+- Creeper/Warden → shelter 대신 flee 사용 (더 빠름)
+- 전투 경험 기억: 승리/도주/사망 + 몹 종류 + 장비 + 위치 → experience.json
+- 위험 지역 감지: 같은 위치 근처 2회 이상 사망 시 경고
+- LLM 컨텍스트에 위협/전투 정보 포함 (더 나은 플래닝)
+- 실제 죽음 메시지 캡처 (하드코딩 제거)
+
+### v6.5
 - Water/Drowning 생존 시스템: 물 빠짐 감지 + 자동 탈출
 - /state에 isInWater, oxygenLevel, isUnderwater 필드 추가
 - /action/escape_water: 3-phase 탈출 (수영상승 → 육지이동 → 블록배치)

@@ -171,13 +171,13 @@ CHAIN_LIBRARY = {
     # ═══════════════════════════════════════════
 
     "get_wood": [
-        {"tool": "mine_block", "args": {"block_type": "oak_log", "count": 6},
-         "type": "search", "skip_if": {"oak_log": 6, "oak_planks": 20},
+        {"tool": "mine_block", "args": {"block_type": "oak_log", "count": 10},
+         "type": "search", "skip_if": {"oak_log": 10, "oak_planks": 32},
          "search_target": "oak_log"},
         {"tool": "craft_item", "args": {"item_name": "oak_planks"},
-         "type": "craft", "skip_if": {"oak_planks": 16}},
+         "type": "craft", "skip_if": {"oak_planks": 24}},
         {"tool": "craft_item", "args": {"item_name": "oak_planks"},
-         "type": "craft", "skip_if": {"oak_planks": 16}},
+         "type": "craft", "skip_if": {"oak_planks": 24}},
         {"tool": "craft_item", "args": {"item_name": "stick"},
          "type": "craft", "skip_if": {"stick": 8}},
     ],

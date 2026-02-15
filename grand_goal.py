@@ -1,9 +1,8 @@
 """
-Grand Goal System v6 — Links tasks to action chains.
+Grand Goal System v7 — File-based goal library + LLM dynamic goal creation.
 
-Each task maps to a chain_name in chain_library.py.
-System auto-checks inventory each tick to complete tasks.
-No LLM needed for task tracking — it's all data-driven.
+Goals are stored in goal_library.json (not hardcoded).
+LLM can create new goals dynamically, which are saved for future reuse.
 """
 
 import time
@@ -125,155 +124,339 @@ def check_task_completion(task: Task, inventory: dict[str, int]) -> bool:
 
 
 # ============================================
-# GOAL DEFINITIONS
+# GOAL LIBRARY — File-based goal storage
 # ============================================
 
-def create_ender_dragon_goal() -> GrandGoal:
-    phases = [
-        Phase("survival", "Phase 1: Basic Survival", "Tools, food, shelter"),
-        Phase("iron", "Phase 2: Iron Age", "Iron gear"),
-        Phase("diamond", "Phase 3: Diamond Age", "Diamond gear"),
-        Phase("nether", "Phase 4: The Nether", "Blaze rods"),
-        Phase("ender", "Phase 5: Eyes of Ender", "Enderpearls + eyes"),
-        Phase("end", "Phase 6: The End", "Defeat the dragon"),
-    ]
-    tasks = [
-        # Phase 1
-        Task("get_wood", "Gather wood and make planks", "get_wood",
-             phase="survival", completion_items={"oak_planks": 12}),
-        Task("make_crafting_table", "Make and place crafting table", "make_crafting_table",
-             requires=["get_wood"], phase="survival",
-             completion_blocks_placed=["crafting_table"]),
-        Task("make_wooden_pickaxe", "Craft wooden pickaxe", "make_wooden_pickaxe",
-             requires=["make_crafting_table"], phase="survival",
-             completion_items={"wooden_pickaxe": 1}),
-        Task("make_stone_pickaxe", "Craft stone pickaxe", "make_stone_pickaxe",
-             requires=["make_wooden_pickaxe"], phase="survival",
-             completion_items={"stone_pickaxe": 1}),
-        Task("find_food", "Hunt animals for food", "find_food",
-             phase="survival"),
-        Task("build_shelter", "Build a shelter", "build_shelter",
-             phase="survival"),
-        # Phase 2
-        Task("make_iron_pickaxe", "Craft iron pickaxe", "make_iron_pickaxe",
-             requires=["make_stone_pickaxe"], phase="iron",
-             completion_items={"iron_pickaxe": 1}),
-        Task("make_iron_sword", "Craft iron sword", "make_iron_sword",
-             requires=["make_stone_pickaxe"], phase="iron",
-             completion_items={"iron_sword": 1}),
-        Task("make_iron_armor", "Craft iron chestplate", "make_iron_armor",
-             requires=["make_stone_pickaxe"], phase="iron",
-             completion_items={"iron_chestplate": 1}, optional=True),
-        Task("make_shield", "Craft a shield", "make_shield",
-             requires=["make_iron_sword"], phase="iron",
-             completion_items={"shield": 1}, optional=True),
-        Task("make_bucket", "Craft a bucket", "make_bucket",
-             requires=["make_stone_pickaxe"], phase="iron",
-             completion_items={"bucket": 1}),
-        # Phase 3
-        Task("mine_diamonds", "Mine 5+ diamonds", "mine_diamonds",
-             requires=["make_iron_pickaxe"], phase="diamond",
-             completion_items={"diamond": 5}),
-        Task("make_diamond_pickaxe", "Craft diamond pickaxe", "make_diamond_pickaxe",
-             requires=["mine_diamonds"], phase="diamond",
-             completion_items={"diamond_pickaxe": 1}),
-        Task("make_diamond_sword", "Craft diamond sword", "make_diamond_sword",
-             requires=["mine_diamonds"], phase="diamond",
-             completion_items={"diamond_sword": 1}),
-        # Phase 4-6 (less automatable — LLM will handle more)
-        Task("get_obsidian", "Mine 10 obsidian", "mine_diamonds",  # reuse dig chain
-             requires=["make_diamond_pickaxe", "make_bucket"], phase="nether",
-             completion_items={"obsidian": 10}),
-        Task("build_portal", "Build nether portal", "",
-             requires=["get_obsidian"], phase="nether"),
-        Task("find_fortress", "Find nether fortress", "",
-             requires=["build_portal"], phase="nether"),
-        Task("kill_blazes", "Kill blazes for 7 rods", "",
-             requires=["find_fortress", "make_diamond_sword"], phase="nether",
-             completion_items={"blaze_rod": 7}),
-        Task("craft_blaze_powder", "Craft blaze powder", "",
-             requires=["kill_blazes"], phase="ender",
-             completion_items={"blaze_powder": 7}),
-        Task("kill_endermen", "Kill endermen for 12 pearls", "",
-             requires=["make_diamond_sword"], phase="ender",
-             completion_items={"ender_pearl": 12}),
-        Task("craft_eyes", "Craft 12 eyes of ender", "",
-             requires=["craft_blaze_powder", "kill_endermen"], phase="ender",
-             completion_items={"ender_eye": 12}),
-        Task("find_stronghold", "Find stronghold", "",
-             requires=["craft_eyes"], phase="end"),
-        Task("activate_portal", "Activate end portal", "",
-             requires=["find_stronghold"], phase="end"),
-        Task("defeat_dragon", "Defeat the Ender Dragon!", "",
-             requires=["activate_portal"], phase="end"),
-    ]
-    return GrandGoal("defeat_ender_dragon", "Defeat the Ender Dragon!", tasks, phases)
+class GoalLibrary:
+    """Manages goal_library.json — stores, retrieves, and searches goal templates."""
 
+    FILE = "goal_library.json"
 
-def create_full_iron_goal() -> GrandGoal:
-    phases = [
-        Phase("basic", "Phase 1: Basics", "Wood and stone"),
-        Phase("iron", "Phase 2: Iron", "Full iron gear"),
-    ]
-    tasks = [
-        Task("get_wood", "Gather wood", "get_wood",
-             phase="basic", completion_items={"oak_planks": 12}),
-        Task("make_crafting_table", "Make crafting table", "make_crafting_table",
-             requires=["get_wood"], phase="basic",
-             completion_blocks_placed=["crafting_table"]),
-        Task("make_wooden_pickaxe", "Wooden pickaxe", "make_wooden_pickaxe",
-             requires=["make_crafting_table"], phase="basic",
-             completion_items={"wooden_pickaxe": 1}),
-        Task("make_stone_pickaxe", "Stone pickaxe", "make_stone_pickaxe",
-             requires=["make_wooden_pickaxe"], phase="basic",
-             completion_items={"stone_pickaxe": 1}),
-        Task("make_iron_pickaxe", "Iron pickaxe", "make_iron_pickaxe",
-             requires=["make_stone_pickaxe"], phase="iron",
-             completion_items={"iron_pickaxe": 1}),
-        Task("make_iron_sword", "Iron sword", "make_iron_sword",
-             requires=["make_stone_pickaxe"], phase="iron",
-             completion_items={"iron_sword": 1}),
-        Task("make_iron_armor", "Iron chestplate", "make_iron_armor",
-             requires=["make_stone_pickaxe"], phase="iron",
-             completion_items={"iron_chestplate": 1}),
-        Task("make_shield", "Shield", "make_shield",
-             requires=["make_iron_sword"], phase="iron",
-             completion_items={"shield": 1}),
-    ]
-    return GrandGoal("full_iron_gear", "Get full iron gear", tasks, phases)
+    VALID_CHAINS = {
+        "get_wood", "mine_stone", "make_crafting_table", "make_wooden_pickaxe",
+        "make_stone_pickaxe", "make_iron_pickaxe", "make_iron_sword",
+        "make_iron_armor", "make_shield", "make_bucket", "mine_diamonds",
+        "make_diamond_pickaxe", "make_diamond_sword", "find_food",
+        "build_shelter", "place_furnace", "place_chest",
+    }
 
+    def __init__(self):
+        self.goals: dict[str, dict] = {}
+        self._load()
 
-def create_cozy_base_goal() -> GrandGoal:
-    phases = [
-        Phase("gather", "Phase 1: Gather", "Collect materials"),
-        Phase("build", "Phase 2: Build", "Build base"),
-    ]
-    tasks = [
-        Task("get_wood", "Get lots of wood", "get_wood",
-             phase="gather", completion_items={"oak_planks": 32}),
-        Task("get_stone", "Mine 64+ cobblestone", "mine_stone",
-             phase="gather", completion_items={"cobblestone": 64}),
-        Task("make_crafting_table", "Place crafting table", "make_crafting_table",
-             requires=["get_wood"], phase="build",
-             completion_blocks_placed=["crafting_table"]),
-        Task("build_main_shelter", "Build shelter", "build_shelter",
-             requires=["get_stone"], phase="build",
-             completion_blocks_placed=["oak_door"]),
-        Task("place_furnace", "Place furnace", "place_furnace",
-             requires=["get_stone"], phase="build",
-             completion_blocks_placed=["furnace"]),
-        Task("place_chests", "Place chests", "place_chest",
-             requires=["get_wood"], phase="build",
-             completion_blocks_placed=["chest"]),
-    ]
-    return GrandGoal("cozy_base", "Build a cozy base", tasks, phases)
+    def _load(self):
+        try:
+            if os.path.exists(self.FILE):
+                with open(self.FILE, "r") as f:
+                    self.goals = json.load(f)
+                print(f"📚 Loaded {len(self.goals)} goals from library")
+            else:
+                self._seed_builtin_goals()
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"⚠️ goal_library.json corrupted ({e}), re-seeding...")
+            self._seed_builtin_goals()
 
+    def _save(self):
+        try:
+            with open(self.FILE, "w") as f:
+                json.dump(self.goals, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"⚠️ Failed to save goal library: {e}")
 
-GRAND_GOAL_REGISTRY = {
-    "defeat_ender_dragon": create_ender_dragon_goal,
-    "full_iron_gear": create_full_iron_goal,
-    "cozy_base": create_cozy_base_goal,
-}
+    def _seed_builtin_goals(self):
+        """Create goal_library.json with the 3 built-in goals."""
+        self.goals = {
+            "defeat_ender_dragon": {
+                "name": "defeat_ender_dragon",
+                "description": "Defeat the Ender Dragon!",
+                "source": "builtin",
+                "phases": [
+                    {"id": "survival", "name": "Phase 1: Basic Survival", "description": "Tools, food, shelter"},
+                    {"id": "iron", "name": "Phase 2: Iron Age", "description": "Iron gear"},
+                    {"id": "diamond", "name": "Phase 3: Diamond Age", "description": "Diamond gear"},
+                    {"id": "nether", "name": "Phase 4: The Nether", "description": "Blaze rods"},
+                    {"id": "ender", "name": "Phase 5: Eyes of Ender", "description": "Enderpearls + eyes"},
+                    {"id": "end", "name": "Phase 6: The End", "description": "Defeat the dragon"},
+                ],
+                "tasks": [
+                    {"id": "get_wood", "description": "Gather wood and make planks", "chain_name": "get_wood",
+                     "requires": [], "phase": "survival", "optional": False,
+                     "completion_items": {"oak_planks": 12}, "completion_blocks_placed": []},
+                    {"id": "make_crafting_table", "description": "Make and place crafting table", "chain_name": "make_crafting_table",
+                     "requires": ["get_wood"], "phase": "survival", "optional": False,
+                     "completion_items": {}, "completion_blocks_placed": ["crafting_table"]},
+                    {"id": "make_wooden_pickaxe", "description": "Craft wooden pickaxe", "chain_name": "make_wooden_pickaxe",
+                     "requires": ["make_crafting_table"], "phase": "survival", "optional": False,
+                     "completion_items": {"wooden_pickaxe": 1}, "completion_blocks_placed": []},
+                    {"id": "make_stone_pickaxe", "description": "Craft stone pickaxe", "chain_name": "make_stone_pickaxe",
+                     "requires": ["make_wooden_pickaxe"], "phase": "survival", "optional": False,
+                     "completion_items": {"stone_pickaxe": 1}, "completion_blocks_placed": []},
+                    {"id": "find_food", "description": "Hunt animals for food", "chain_name": "find_food",
+                     "requires": [], "phase": "survival", "optional": False,
+                     "completion_items": {}, "completion_blocks_placed": []},
+                    {"id": "build_shelter", "description": "Build a shelter", "chain_name": "build_shelter",
+                     "requires": [], "phase": "survival", "optional": False,
+                     "completion_items": {}, "completion_blocks_placed": []},
+                    {"id": "make_iron_pickaxe", "description": "Craft iron pickaxe", "chain_name": "make_iron_pickaxe",
+                     "requires": ["make_stone_pickaxe"], "phase": "iron", "optional": False,
+                     "completion_items": {"iron_pickaxe": 1}, "completion_blocks_placed": []},
+                    {"id": "make_iron_sword", "description": "Craft iron sword", "chain_name": "make_iron_sword",
+                     "requires": ["make_stone_pickaxe"], "phase": "iron", "optional": False,
+                     "completion_items": {"iron_sword": 1}, "completion_blocks_placed": []},
+                    {"id": "make_iron_armor", "description": "Craft iron chestplate", "chain_name": "make_iron_armor",
+                     "requires": ["make_stone_pickaxe"], "phase": "iron", "optional": True,
+                     "completion_items": {"iron_chestplate": 1}, "completion_blocks_placed": []},
+                    {"id": "make_shield", "description": "Craft a shield", "chain_name": "make_shield",
+                     "requires": ["make_iron_sword"], "phase": "iron", "optional": True,
+                     "completion_items": {"shield": 1}, "completion_blocks_placed": []},
+                    {"id": "make_bucket", "description": "Craft a bucket", "chain_name": "make_bucket",
+                     "requires": ["make_stone_pickaxe"], "phase": "iron", "optional": False,
+                     "completion_items": {"bucket": 1}, "completion_blocks_placed": []},
+                    {"id": "mine_diamonds", "description": "Mine 5+ diamonds", "chain_name": "mine_diamonds",
+                     "requires": ["make_iron_pickaxe"], "phase": "diamond", "optional": False,
+                     "completion_items": {"diamond": 5}, "completion_blocks_placed": []},
+                    {"id": "make_diamond_pickaxe", "description": "Craft diamond pickaxe", "chain_name": "make_diamond_pickaxe",
+                     "requires": ["mine_diamonds"], "phase": "diamond", "optional": False,
+                     "completion_items": {"diamond_pickaxe": 1}, "completion_blocks_placed": []},
+                    {"id": "make_diamond_sword", "description": "Craft diamond sword", "chain_name": "make_diamond_sword",
+                     "requires": ["mine_diamonds"], "phase": "diamond", "optional": False,
+                     "completion_items": {"diamond_sword": 1}, "completion_blocks_placed": []},
+                    {"id": "get_obsidian", "description": "Mine 10 obsidian", "chain_name": "mine_diamonds",
+                     "requires": ["make_diamond_pickaxe", "make_bucket"], "phase": "nether", "optional": False,
+                     "completion_items": {"obsidian": 10}, "completion_blocks_placed": []},
+                    {"id": "build_portal", "description": "Build nether portal", "chain_name": "",
+                     "requires": ["get_obsidian"], "phase": "nether", "optional": False,
+                     "completion_items": {}, "completion_blocks_placed": []},
+                    {"id": "find_fortress", "description": "Find nether fortress", "chain_name": "",
+                     "requires": ["build_portal"], "phase": "nether", "optional": False,
+                     "completion_items": {}, "completion_blocks_placed": []},
+                    {"id": "kill_blazes", "description": "Kill blazes for 7 rods", "chain_name": "",
+                     "requires": ["find_fortress", "make_diamond_sword"], "phase": "nether", "optional": False,
+                     "completion_items": {"blaze_rod": 7}, "completion_blocks_placed": []},
+                    {"id": "craft_blaze_powder", "description": "Craft blaze powder", "chain_name": "",
+                     "requires": ["kill_blazes"], "phase": "ender", "optional": False,
+                     "completion_items": {"blaze_powder": 7}, "completion_blocks_placed": []},
+                    {"id": "kill_endermen", "description": "Kill endermen for 12 pearls", "chain_name": "",
+                     "requires": ["make_diamond_sword"], "phase": "ender", "optional": False,
+                     "completion_items": {"ender_pearl": 12}, "completion_blocks_placed": []},
+                    {"id": "craft_eyes", "description": "Craft 12 eyes of ender", "chain_name": "",
+                     "requires": ["craft_blaze_powder", "kill_endermen"], "phase": "ender", "optional": False,
+                     "completion_items": {"ender_eye": 12}, "completion_blocks_placed": []},
+                    {"id": "find_stronghold", "description": "Find stronghold", "chain_name": "",
+                     "requires": ["craft_eyes"], "phase": "end", "optional": False,
+                     "completion_items": {}, "completion_blocks_placed": []},
+                    {"id": "activate_portal", "description": "Activate end portal", "chain_name": "",
+                     "requires": ["find_stronghold"], "phase": "end", "optional": False,
+                     "completion_items": {}, "completion_blocks_placed": []},
+                    {"id": "defeat_dragon", "description": "Defeat the Ender Dragon!", "chain_name": "",
+                     "requires": ["activate_portal"], "phase": "end", "optional": False,
+                     "completion_items": {}, "completion_blocks_placed": []},
+                ],
+            },
+            "full_iron_gear": {
+                "name": "full_iron_gear",
+                "description": "Get full iron gear",
+                "source": "builtin",
+                "phases": [
+                    {"id": "basic", "name": "Phase 1: Basics", "description": "Wood and stone"},
+                    {"id": "iron", "name": "Phase 2: Iron", "description": "Full iron gear"},
+                ],
+                "tasks": [
+                    {"id": "get_wood", "description": "Gather wood", "chain_name": "get_wood",
+                     "requires": [], "phase": "basic", "optional": False,
+                     "completion_items": {"oak_planks": 12}, "completion_blocks_placed": []},
+                    {"id": "make_crafting_table", "description": "Make crafting table", "chain_name": "make_crafting_table",
+                     "requires": ["get_wood"], "phase": "basic", "optional": False,
+                     "completion_items": {}, "completion_blocks_placed": ["crafting_table"]},
+                    {"id": "make_wooden_pickaxe", "description": "Wooden pickaxe", "chain_name": "make_wooden_pickaxe",
+                     "requires": ["make_crafting_table"], "phase": "basic", "optional": False,
+                     "completion_items": {"wooden_pickaxe": 1}, "completion_blocks_placed": []},
+                    {"id": "make_stone_pickaxe", "description": "Stone pickaxe", "chain_name": "make_stone_pickaxe",
+                     "requires": ["make_wooden_pickaxe"], "phase": "basic", "optional": False,
+                     "completion_items": {"stone_pickaxe": 1}, "completion_blocks_placed": []},
+                    {"id": "make_iron_pickaxe", "description": "Iron pickaxe", "chain_name": "make_iron_pickaxe",
+                     "requires": ["make_stone_pickaxe"], "phase": "iron", "optional": False,
+                     "completion_items": {"iron_pickaxe": 1}, "completion_blocks_placed": []},
+                    {"id": "make_iron_sword", "description": "Iron sword", "chain_name": "make_iron_sword",
+                     "requires": ["make_stone_pickaxe"], "phase": "iron", "optional": False,
+                     "completion_items": {"iron_sword": 1}, "completion_blocks_placed": []},
+                    {"id": "make_iron_armor", "description": "Iron chestplate", "chain_name": "make_iron_armor",
+                     "requires": ["make_stone_pickaxe"], "phase": "iron", "optional": False,
+                     "completion_items": {"iron_chestplate": 1}, "completion_blocks_placed": []},
+                    {"id": "make_shield", "description": "Shield", "chain_name": "make_shield",
+                     "requires": ["make_iron_sword"], "phase": "iron", "optional": False,
+                     "completion_items": {"shield": 1}, "completion_blocks_placed": []},
+                ],
+            },
+            "cozy_base": {
+                "name": "cozy_base",
+                "description": "Build a cozy base",
+                "source": "builtin",
+                "phases": [
+                    {"id": "gather", "name": "Phase 1: Gather", "description": "Collect materials"},
+                    {"id": "build", "name": "Phase 2: Build", "description": "Build base"},
+                ],
+                "tasks": [
+                    {"id": "get_wood", "description": "Get lots of wood", "chain_name": "get_wood",
+                     "requires": [], "phase": "gather", "optional": False,
+                     "completion_items": {"oak_planks": 32}, "completion_blocks_placed": []},
+                    {"id": "get_stone", "description": "Mine 64+ cobblestone", "chain_name": "mine_stone",
+                     "requires": [], "phase": "gather", "optional": False,
+                     "completion_items": {"cobblestone": 64}, "completion_blocks_placed": []},
+                    {"id": "make_crafting_table", "description": "Place crafting table", "chain_name": "make_crafting_table",
+                     "requires": ["get_wood"], "phase": "build", "optional": False,
+                     "completion_items": {}, "completion_blocks_placed": ["crafting_table"]},
+                    {"id": "build_main_shelter", "description": "Build shelter", "chain_name": "build_shelter",
+                     "requires": ["get_stone"], "phase": "build", "optional": False,
+                     "completion_items": {}, "completion_blocks_placed": ["oak_door"]},
+                    {"id": "place_furnace", "description": "Place furnace", "chain_name": "place_furnace",
+                     "requires": ["get_stone"], "phase": "build", "optional": False,
+                     "completion_items": {}, "completion_blocks_placed": ["furnace"]},
+                    {"id": "place_chests", "description": "Place chests", "chain_name": "place_chest",
+                     "requires": ["get_wood"], "phase": "build", "optional": False,
+                     "completion_items": {}, "completion_blocks_placed": ["chest"]},
+                ],
+            },
+        }
+        self._save()
+        print(f"📚 Seeded goal library with {len(self.goals)} built-in goals")
+
+    # ── Goal Retrieval ──
+
+    def get_goal(self, name: str) -> Optional[GrandGoal]:
+        data = self.goals.get(name)
+        if not data:
+            return None
+        return self._dict_to_grand_goal(data)
+
+    def _dict_to_grand_goal(self, data: dict) -> GrandGoal:
+        phases = [Phase(id=p["id"], name=p["name"], description=p["description"])
+                  for p in data.get("phases", [])]
+        tasks = []
+        for td in data.get("tasks", []):
+            tasks.append(Task(
+                id=td["id"],
+                description=td["description"],
+                chain_name=td.get("chain_name", ""),
+                requires=td.get("requires", []),
+                phase=td.get("phase", ""),
+                optional=td.get("optional", False),
+                completion_items=td.get("completion_items", {}),
+                completion_blocks_placed=td.get("completion_blocks_placed", []),
+            ))
+        return GrandGoal(
+            name=data["name"],
+            description=data["description"],
+            tasks=tasks,
+            phases=phases,
+        )
+
+    def list_goals(self) -> list[dict]:
+        return [
+            {
+                "name": name,
+                "description": data["description"],
+                "source": data.get("source", "unknown"),
+                "task_count": len(data.get("tasks", [])),
+            }
+            for name, data in self.goals.items()
+        ]
+
+    # ── Goal Creation ──
+
+    def save_goal(self, name: str, description: str, phases: list[dict],
+                  tasks: list[dict], source: str = "llm_created") -> str:
+        errors = self._validate_goal(name, tasks)
+        if errors:
+            return f"Validation failed: {'; '.join(errors)}"
+        self.goals[name] = {
+            "name": name,
+            "description": description,
+            "source": source,
+            "phases": phases,
+            "tasks": tasks,
+        }
+        self._save()
+        return f"Goal '{name}' saved ({len(tasks)} tasks)"
+
+    # ── Similarity Search ──
+
+    def find_similar(self, description: str) -> list[str]:
+        desc_words = set(description.lower().split())
+        if not desc_words:
+            return []
+        scores = []
+        for name, data in self.goals.items():
+            goal_words = set(data["description"].lower().split())
+            goal_words.update(name.lower().replace("_", " ").split())
+            overlap = len(desc_words & goal_words)
+            if overlap > 0:
+                score = overlap / max(len(desc_words), len(goal_words))
+                scores.append((name, score))
+        scores.sort(key=lambda x: -x[1])
+        return [name for name, score in scores if score > 0.2]
+
+    # ── Validation ──
+
+    def _validate_goal(self, name: str, tasks: list[dict]) -> list[str]:
+        errors = []
+        if not name or not isinstance(name, str):
+            errors.append("Goal name must be a non-empty string")
+        if not tasks:
+            errors.append("Goal must have at least one task")
+            return errors
+
+        all_task_ids = {t.get("id", "") for t in tasks}
+        seen_ids = set()
+
+        for i, t in enumerate(tasks):
+            tid = t.get("id", "")
+            if not tid:
+                errors.append(f"Task {i} missing 'id'")
+                continue
+            if tid in seen_ids:
+                errors.append(f"Duplicate task id: '{tid}'")
+            seen_ids.add(tid)
+
+            chain = t.get("chain_name", "")
+            if chain and chain not in self.VALID_CHAINS:
+                errors.append(
+                    f"Task '{tid}' has invalid chain_name '{chain}'. "
+                    f"Valid: {', '.join(sorted(self.VALID_CHAINS))}"
+                )
+
+            for req in t.get("requires", []):
+                if req not in all_task_ids:
+                    errors.append(f"Task '{tid}' requires unknown task '{req}'")
+
+        if not errors:
+            errors.extend(self._check_circular_deps(tasks))
+        return errors
+
+    def _check_circular_deps(self, tasks: list[dict]) -> list[str]:
+        task_map = {t["id"]: t.get("requires", []) for t in tasks}
+        visited = set()
+        in_stack = set()
+
+        def dfs(tid):
+            if tid in in_stack:
+                return [f"Circular dependency involving '{tid}'"]
+            if tid in visited:
+                return []
+            in_stack.add(tid)
+            visited.add(tid)
+            for dep in task_map.get(tid, []):
+                errs = dfs(dep)
+                if errs:
+                    return errs
+            in_stack.discard(tid)
+            return []
+
+        for tid in task_map:
+            errs = dfs(tid)
+            if errs:
+                return errs
+        return []
 
 
 # ============================================
@@ -286,16 +469,21 @@ class GrandGoalManager:
     MAX_SKIP_RETRIES = 2  # retry skipped tasks up to 2 more times
 
     def __init__(self):
+        self.goal_library = GoalLibrary()
         self.active_goal: Optional[GrandGoal] = None
         self.completed_goals: list[str] = []
         self.current_task_id: Optional[str] = None
         self.task_fail_count: dict[str, int] = {}  # task_id → consecutive fail count
         self.skip_retry_count: dict[str, int] = {}  # task_id → how many times retried after skip
+        self.user_requested: bool = False  # True when user explicitly requested this goal
         self._load()
 
     def _save(self):
         try:
-            data = {"completed_goals": self.completed_goals}
+            data = {
+                "completed_goals": self.completed_goals,
+                "user_requested": self.user_requested,
+            }
             if self.active_goal:
                 data["active_goal"] = {
                     "name": self.active_goal.name,
@@ -317,11 +505,13 @@ class GrandGoalManager:
             with open(self.SAVE_FILE, "r") as f:
                 data = json.load(f)
             self.completed_goals = data.get("completed_goals", [])
+            self.user_requested = data.get("user_requested", False)
             if "active_goal" in data:
                 gd = data["active_goal"]
                 name = gd["name"]
-                if name in GRAND_GOAL_REGISTRY:
-                    self.active_goal = GRAND_GOAL_REGISTRY[name]()
+                goal = self.goal_library.get_goal(name)
+                if goal:
+                    self.active_goal = goal
                     self.active_goal.started_at = gd.get("started_at", time.time())
                     status_map = {t["id"]: t["status"] for t in gd.get("tasks", [])}
                     for task in self.active_goal.tasks:
@@ -332,6 +522,8 @@ class GrandGoalManager:
                     self.task_fail_count = gd.get("task_fail_count", {})
                     self.skip_retry_count = gd.get("skip_retry_count", {})
                     print(f"🏆 Loaded: {self.active_goal.description} ({self.active_goal.overall_progress})")
+                else:
+                    print(f"⚠️ Goal '{name}' not found in library, ignoring saved state")
         except Exception as e:
             print(f"⚠️ Load error: {e}")
 
@@ -361,6 +553,7 @@ class GrandGoalManager:
                 desc = self.active_goal.description
                 self.active_goal = None
                 self.current_task_id = None
+                self.user_requested = False  # Reset priority after goal completion
                 self._save()
                 messages.append(f"🏆🎉 GRAND GOAL ACHIEVED: {desc}! ({elapsed/60:.1f}min)")
         return messages
@@ -382,6 +575,13 @@ class GrandGoalManager:
         """Pick next available task. If none, retry skipped tasks."""
         if not self.active_goal:
             return None
+
+        # ── Fix orphaned IN_PROGRESS tasks ──
+        # Task is IN_PROGRESS but current_task_id points elsewhere → reset to AVAILABLE
+        for task in self.active_goal.tasks:
+            if task.status == TaskStatus.IN_PROGRESS and task.id != self.current_task_id:
+                task.status = TaskStatus.AVAILABLE
+                print(f"   🔧 Reset orphaned task '{task.id}' from IN_PROGRESS → AVAILABLE")
 
         available = self.active_goal.get_available_tasks()
 
@@ -440,6 +640,7 @@ class GrandGoalManager:
                     self.completed_goals.append(self.active_goal.name)
                     desc = self.active_goal.description
                     self.active_goal = None
+                    self.user_requested = False
                     self._save()
                     return f"🏆 GRAND GOAL ACHIEVED: {desc}! ({elapsed/60:.1f}min)"
                 return f"✅ '{task_id}' done! {self.active_goal.overall_progress}"
@@ -460,27 +661,71 @@ class GrandGoalManager:
 
     # ── Goal Management ──
 
-    def set_grand_goal(self, goal_name: str) -> str:
-        if goal_name not in GRAND_GOAL_REGISTRY:
-            return f"Unknown. Available: {', '.join(GRAND_GOAL_REGISTRY.keys())}"
-        self.active_goal = GRAND_GOAL_REGISTRY[goal_name]()
+    def set_grand_goal(self, goal_name: str, user_requested: bool = False) -> str:
+        goal = self.goal_library.get_goal(goal_name)
+        if not goal:
+            available = [g["name"] for g in self.goal_library.list_goals()]
+            return f"Unknown goal '{goal_name}'. Available: {', '.join(available)}"
+        self.active_goal = goal
+        self.user_requested = user_requested
         self.current_task_id = None
         self.task_fail_count = {}
         self.skip_retry_count = {}
         self.auto_check_progress()
-        self.active_goal.refresh_availability()
+        if self.active_goal:
+            self.active_goal.refresh_availability()
         self._save()
-        available = self.active_goal.get_available_tasks()
-        return (
-            f"🏆 GRAND GOAL: {self.active_goal.description}\n"
-            f"   {len(self.active_goal.tasks)} tasks. Next: {', '.join(t.id for t in available[:5])}"
-        )
+        if self.active_goal:
+            available = self.active_goal.get_available_tasks()
+            return (
+                f"🏆 GRAND GOAL: {self.active_goal.description}\n"
+                f"   {len(self.active_goal.tasks)} tasks. Next: {', '.join(t.id for t in available[:5])}"
+            )
+        return f"🏆 Goal '{goal_name}' already complete!"
+
+    def create_grand_goal(self, name: str, description: str, phases: list[dict],
+                          tasks: list[dict], user_requested: bool = False,
+                          save_to_library: bool = True) -> str:
+        """Create a new goal from LLM-generated data."""
+        # Validate
+        errors = self.goal_library._validate_goal(name, tasks)
+        if errors:
+            return f"Invalid goal: {'; '.join(errors)}"
+
+        # Save to library
+        if save_to_library:
+            source = "user_requested" if user_requested else "llm_created"
+            save_result = self.goal_library.save_goal(name, description, phases, tasks, source)
+            print(f"   📚 {save_result}")
+
+        # Build and set active
+        self.active_goal = self.goal_library._dict_to_grand_goal({
+            "name": name, "description": description,
+            "phases": phases, "tasks": tasks,
+        })
+        self.user_requested = user_requested
+        self.current_task_id = None
+        self.task_fail_count = {}
+        self.skip_retry_count = {}
+        self.auto_check_progress()
+        if self.active_goal:
+            self.active_goal.refresh_availability()
+        self._save()
+        if self.active_goal:
+            available = self.active_goal.get_available_tasks()
+            return (
+                f"🏆 NEW GRAND GOAL: {description}\n"
+                f"   {len(self.active_goal.tasks)} tasks. Next: {', '.join(t.id for t in available[:5])}"
+            )
+        return f"🏆 Goal '{name}' already complete!"
 
     # ── Status ──
 
     def get_prompt_context(self) -> str:
         if not self.active_goal:
-            return "🏆 NO GRAND GOAL. Available: defeat_ender_dragon, full_iron_gear, cozy_base"
+            goals = self.goal_library.list_goals()
+            goal_list = ", ".join(f"{g['name']}({g['task_count']} tasks)" for g in goals)
+            return f"🏆 NO GRAND GOAL. Saved goals: {goal_list}"
         goal = self.active_goal
         goal.refresh_availability()
         lines = [f"🏆 GRAND GOAL: {goal.description} ({goal.overall_progress})"]
@@ -493,6 +738,14 @@ class GrandGoalManager:
                         "blocked": "🔒", "in_progress": "▶️"}[task.status.value]
                 current = " ← NOW" if task.id == self.current_task_id else ""
                 lines.append(f"    {icon} {task.description}{current}")
+        # Show tasks without phase
+        no_phase_tasks = [t for t in goal.tasks if not t.phase]
+        if no_phase_tasks:
+            for task in no_phase_tasks:
+                icon = {"completed": "✅", "skipped": "⏭️", "available": "⬜",
+                        "blocked": "🔒", "in_progress": "▶️"}[task.status.value]
+                current = " ← NOW" if task.id == self.current_task_id else ""
+                lines.append(f"  {icon} {task.description}{current}")
         return "\n".join(lines)
 
     def get_status(self) -> dict:

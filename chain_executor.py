@@ -29,6 +29,14 @@ from grand_goal import GrandGoalManager, get_inventory_counts, check_block_nearb
 BOT_API = os.getenv("BOT_API_URL", "http://localhost:3001")
 
 
+def abort_bot_action():
+    """Tell the Node.js server to cancel any long-running action."""
+    try:
+        requests.post(f"{BOT_API}/abort", timeout=3)
+    except Exception:
+        pass
+
+
 # ============================================
 # DATA CLASSES
 # ============================================
@@ -91,7 +99,7 @@ def call_tool(tool_name: str, args: dict, timeout: int = 60) -> dict:
         if tool_name == "mine_block":
             count = int(args.get("count", 1))
             timeout = max(60, count * 8)  # ~8s per block (pathfind + dig + collect)
-        elif tool_name in ("dig_down", "dig_tunnel", "dig_shelter", "build_shelter", "escape_water"):
+        elif tool_name in ("dig_down", "dig_tunnel", "dig_shelter", "build_shelter", "escape_water", "flee"):
             timeout = 120
 
         endpoint_map = {
@@ -104,6 +112,7 @@ def call_tool(tool_name: str, args: dict, timeout: int = 60) -> dict:
             "attack_entity": ("POST", "/action/attack", {"entity_type": args.get("entity_type", "")}),
             "dig_shelter": ("POST", "/action/dig_shelter", {}),
             "escape_water": ("POST", "/action/escape_water", {}),
+            "flee": ("POST", "/action/flee", {"distance": args.get("distance", 30)}),
             "dig_down": ("POST", "/action/dig_down", {"depth": args.get("depth", 10), "target_y": args.get("target_y", 0)}),
             "dig_tunnel": ("POST", "/action/dig_tunnel", {"direction": args.get("direction", "north"), "length": args.get("length", 10)}),
             "build_shelter": ("POST", "/action/build_shelter", {}),
@@ -156,6 +165,12 @@ def call_tool(tool_name: str, args: dict, timeout: int = 60) -> dict:
 
         return result
     except Exception as e:
+        err_msg = str(e).lower()
+        if "timed out" in err_msg or "timeout" in err_msg:
+            print(f"   [abort] Timeout on {tool_name}, sending abort to server")
+            abort_bot_action()
+            time.sleep(1.5)  # let server finish cleanup
+            return {"success": False, "message": f"Timeout: {tool_name} took too long, aborted server action"}
         return {"success": False, "message": f"API error: {e}"}
 
 
@@ -177,15 +192,36 @@ def get_threat_assessment() -> dict:
         return {"recommendation": "safe", "threats": {"count": 0}}
 
 
+def get_combat_status() -> dict:
+    """Get real-time combat status (attack detection)."""
+    try:
+        r = requests.get(f"{BOT_API}/combat_status", timeout=3)
+        return r.json()
+    except:
+        return {"isUnderAttack": False}
+
+
 # ============================================
 # LAYER 0: INSTINCT (no thinking)
 # ============================================
 
 _last_shelter_time = 0  # module-level cooldown tracker
+_previous_health = 20.0  # Track health between ticks for delta detection
+
+def _equip_best_weapon(inventory: list) -> Optional[str]:
+    """Equip best available weapon. Returns weapon name or None."""
+    inv_dict = {i["name"]: i["count"] for i in inventory}
+    sword_tiers = ["wooden_sword", "stone_sword", "iron_sword", "diamond_sword"]
+    for sword in reversed(sword_tiers):
+        if inv_dict.get(sword, 0) > 0:
+            call_tool("equip_item", {"item_name": sword})
+            return sword
+    return None
+
 
 def check_instinct(state: dict, threat: dict) -> Optional[TickResult]:
     """Check for immediate survival needs. Returns action if triggered."""
-    global _last_shelter_time
+    global _last_shelter_time, _previous_health
 
     health = state.get("health", 20)
     food = state.get("food", 20)
@@ -197,6 +233,12 @@ def check_instinct(state: dict, threat: dict) -> Optional[TickResult]:
     position = state.get("position", {})
     bot_y = float(position.get("y", 64))
 
+    # Combat state from /state
+    combat = state.get("combat", {})
+    is_under_attack = combat.get("isUnderAttack", False)
+    last_attacker = combat.get("lastAttacker", None)
+    time_since_hit = combat.get("timeSinceHit", None)
+
     is_sheltered = (
         environment in ("indoors", "underground", "deep_underground")
         or not can_see_sky
@@ -207,10 +249,15 @@ def check_instinct(state: dict, threat: dict) -> Optional[TickResult]:
         "bread", "apple", "golden_apple", "baked_potato", "sweet_berries",
         "cooked_salmon", "cooked_cod"
     ) for i in inventory)
+    has_weapon = any(i["name"].endswith(("_sword", "_axe")) for i in inventory)
 
     rec = threat.get("recommendation", "safe")
     threat_details = threat.get("threats", {}).get("details", [])
     threat_count = threat.get("threats", {}).get("count", 0)
+
+    # Health delta detection (between ticks)
+    health_delta = _previous_health - health
+    _previous_health = health
 
     # Shelter cooldown — don't spam dig_shelter every tick
     shelter_cooldown = 60  # seconds
@@ -221,6 +268,11 @@ def check_instinct(state: dict, threat: dict) -> Optional[TickResult]:
         if has_food:
             result = call_tool("eat_food", {})
             return TickResult(0, "eat_food()", result.get("message", ""), result.get("success", False))
+        elif is_under_attack:
+            # Critical HP + under attack = flee immediately (don't wait for shelter cooldown)
+            print(f"   🏃 Critical HP + under attack → flee!")
+            result = call_tool("flee", {})
+            return TickResult(0, "flee() [critical HP + under attack]", result.get("message", ""), result.get("success", False))
         elif not shelter_on_cooldown:
             _last_shelter_time = time.time()
             result = call_tool("dig_shelter", {})
@@ -231,14 +283,10 @@ def check_instinct(state: dict, threat: dict) -> Optional[TickResult]:
     oxygen_level = state.get("oxygenLevel", 20)
 
     if is_in_water and oxygen_level <= 12:
-        # Auto-equip turtle_helmet for water breathing if available
         has_turtle_helmet = any(i["name"] == "turtle_helmet" for i in inventory)
         if has_turtle_helmet:
             call_tool("equip_item", {"item_name": "turtle_helmet", "destination": "head"})
-
-        # With turtle helmet, only escape at critical oxygen (gives water breathing)
         oxygen_threshold = 5 if has_turtle_helmet else 12
-
         if oxygen_level <= oxygen_threshold:
             label = "drowning!" if oxygen_level <= 5 else "low oxygen"
             print(f"   🌊 Water escape triggered: oxygen={oxygen_level}, inWater={is_in_water}")
@@ -246,27 +294,97 @@ def check_instinct(state: dict, threat: dict) -> Optional[TickResult]:
             return TickResult(0, f"escape_water() [{label}]",
                             result.get("message", ""), result.get("success", False))
 
+    # ── Sudden health drop (being attacked without knowing) ──
+    if health_delta >= 4 and threat_count > 0:
+        # Lost 4+ HP in one tick = definitely under attack
+        attacker_type = last_attacker.get("type", "unknown") if last_attacker else "unknown"
+        print(f"   ⚔️ Sudden HP drop: -{health_delta:.0f} HP! Attacker: {attacker_type}")
+        if rec in ("flee", "avoid") or not has_weapon or health < 10:
+            # Outmatched or low HP — flee
+            result = call_tool("flee", {})
+            return TickResult(0, f"flee() [sudden damage -{health_delta:.0f}HP from {attacker_type}]",
+                            result.get("message", ""), result.get("success", False))
+        else:
+            # We can fight — engage
+            _equip_best_weapon(inventory)
+            result = call_tool("attack_entity", {"entity_type": attacker_type})
+            return TickResult(0, f"attack_entity({attacker_type}) [counter-attack, -{health_delta:.0f}HP]",
+                            result.get("message", ""), result.get("success", False))
+
+    # ── Actively being attacked (combat state from server) ──
+    if is_under_attack and time_since_hit is not None and time_since_hit <= 3:
+        attacker_type = last_attacker.get("type", "unknown") if last_attacker else "unknown"
+        attacker_dist = last_attacker.get("distance", 99) if last_attacker else 99
+        print(f"   ⚔️ Under attack by {attacker_type} ({attacker_dist}m away)! rec={rec}")
+
+        if rec == "flee":
+            result = call_tool("flee", {})
+            return TickResult(0, f"flee() [under attack by {attacker_type}, flee rec]",
+                            result.get("message", ""), result.get("success", False))
+        elif rec == "avoid" or not has_weapon:
+            # Can't fight — flee
+            result = call_tool("flee", {})
+            return TickResult(0, f"flee() [under attack by {attacker_type}, no weapon/outmatched]",
+                            result.get("message", ""), result.get("success", False))
+        elif rec in ("fight", "fight_careful"):
+            # We can fight — eat first if low HP + fight_careful
+            if rec == "fight_careful" and health < 12 and has_food:
+                call_tool("eat_food", {})
+            _equip_best_weapon(inventory)
+            result = call_tool("attack_entity", {"entity_type": attacker_type})
+            return TickResult(0, f"attack_entity({attacker_type}) [{rec}, under attack]",
+                            result.get("message", ""), result.get("success", False))
+
     # ── Creeper very close ──
     for td in threat_details:
         if td.get("type") == "creeper" and td.get("distance", 99) < 5:
-            if not shelter_on_cooldown:
-                _last_shelter_time = time.time()
-                result = call_tool("dig_shelter", {})
-                return TickResult(0, "dig_shelter() [creeper close!]", result.get("message", ""), result.get("success", False))
+            # Creepers: always flee (don't dig shelter, too slow)
+            print(f"   💥 Creeper at {td.get('distance')}m! Fleeing!")
+            result = call_tool("flee", {})
+            return TickResult(0, "flee() [creeper close!]", result.get("message", ""), result.get("success", False))
 
     # ── Warden ──
     for td in threat_details:
         if td.get("type") == "warden":
-            if not shelter_on_cooldown:
-                _last_shelter_time = time.time()
-                result = call_tool("dig_shelter", {})
-                return TickResult(0, "dig_shelter() [warden!]", result.get("message", ""), result.get("success", False))
+            result = call_tool("flee", {})
+            return TickResult(0, "flee() [warden!]", result.get("message", ""), result.get("success", False))
 
-    # ── Flee recommendation ──
-    if rec == "flee" and not is_sheltered and not shelter_on_cooldown:
+    # ── Flee recommendation (not yet under attack but dangerous) ──
+    if rec == "flee" and not shelter_on_cooldown:
+        # Try flee first, shelter as fallback
+        result = call_tool("flee", {})
+        if result.get("success"):
+            return TickResult(0, "flee() [threat assessment: flee]", result.get("message", ""), True)
+        # Flee failed — dig shelter
         _last_shelter_time = time.time()
         result = call_tool("dig_shelter", {})
-        return TickResult(0, "dig_shelter() [flee!]", result.get("message", ""), result.get("success", False))
+        return TickResult(0, "dig_shelter() [flee failed, shelter fallback]", result.get("message", ""), result.get("success", False))
+
+    # ── Fight recommendation (proactive engagement) ──
+    if rec in ("fight", "fight_careful") and threat_count > 0:
+        closest_hostile = min((td for td in threat_details), key=lambda t: t.get("distance", 99), default=None)
+        if closest_hostile and closest_hostile.get("distance", 99) <= 8:
+            mob_type = closest_hostile.get("type", "")
+            # Don't proactively fight creepers or warden (handled above)
+            if mob_type not in ("creeper", "warden"):
+                if rec == "fight_careful" and health < 12 and has_food:
+                    call_tool("eat_food", {})
+                _equip_best_weapon(inventory)
+                print(f"   ⚔️ Proactive combat: {mob_type} at {closest_hostile.get('distance')}m (rec={rec})")
+                result = call_tool("attack_entity", {"entity_type": mob_type})
+                return TickResult(0, f"attack_entity({mob_type}) [proactive {rec}]",
+                                result.get("message", ""), result.get("success", False))
+
+    # ── Avoid recommendation (outmatched, disengage) ──
+    if rec == "avoid" and threat_count > 0:
+        closest_hostile = min((td for td in threat_details), key=lambda t: t.get("distance", 99), default=None)
+        if closest_hostile and closest_hostile.get("distance", 99) <= 6:
+            # Threat too close while outmatched — flee
+            mob_type = closest_hostile.get("type", "")
+            print(f"   🏃 Avoid: {mob_type} at {closest_hostile.get('distance')}m, outmatched!")
+            result = call_tool("flee", {})
+            return TickResult(0, f"flee() [avoid {mob_type}, outmatched]",
+                            result.get("message", ""), result.get("success", False))
 
     # ── Night on surface ──
     if not is_safe_outside and not is_sheltered and not shelter_on_cooldown:
@@ -289,16 +407,9 @@ def check_instinct(state: dict, threat: dict) -> Optional[TickResult]:
     if is_sheltered and threat_count > 0:
         closest = min((td["distance"] for td in threat_details), default=99)
         if closest <= 5:
-            has_weapon = any(i["name"].endswith(("_sword", "_axe")) for i in inventory)
             if has_weapon:
-                # Auto-equip best weapon before fighting
-                inv_dict = {i["name"]: i["count"] for i in inventory}
-                sword_tiers = ["wooden_sword", "stone_sword", "iron_sword", "diamond_sword"]
-                for sword in reversed(sword_tiers):
-                    if inv_dict.get(sword, 0) > 0:
-                        call_tool("equip_item", {"item_name": sword})
-                        break
                 mob_type = threat_details[0].get("type", "")
+                _equip_best_weapon(inventory)
                 result = call_tool("attack_entity", {"entity_type": mob_type})
                 return TickResult(0, f"attack_entity({mob_type}) [mob in shelter]",
                                 result.get("message", ""), result.get("success", False))
@@ -423,14 +534,27 @@ class ChainExecutor:
             self.active_chain = None
             return TickResult(1, "chain_complete", f"Chain '{name}' completed (some steps skipped)!", True)
 
-        # ── Water awareness (Layer 1) ──
-        # If underwater with declining oxygen during chain, escape first
-        water_state = get_bot_state()
-        if water_state.get("isInWater") and water_state.get("oxygenLevel", 20) < 10:
-            print(f"   🌊 Underwater during chain (oxygen={water_state.get('oxygenLevel')}), escaping first...")
+        # ── Environmental awareness (Layer 1) ──
+        mid_chain_state = get_bot_state()
+
+        # Water: escape if drowning
+        if mid_chain_state.get("isInWater") and mid_chain_state.get("oxygenLevel", 20) < 10:
+            print(f"   🌊 Underwater during chain (oxygen={mid_chain_state.get('oxygenLevel')}), escaping first...")
             result = call_tool("escape_water", {})
             return TickResult(1, "escape_water() [mid-chain]",
                             result.get("message", ""), result.get("success", False))
+
+        # Combat: if being attacked during chain, let instinct handle it next tick
+        # (escalate to LLM if ongoing combat persists)
+        mid_combat = mid_chain_state.get("combat", {})
+        if mid_combat.get("isUnderAttack") and mid_combat.get("timeSinceHit", 99) <= 2:
+            attacker = mid_combat.get("lastAttacker", {})
+            attacker_type = attacker.get("type", "unknown") if attacker else "unknown"
+            print(f"   ⚔️ Under attack during chain by {attacker_type}! Pausing chain for combat response.")
+            # Don't execute the step — return and let check_instinct handle it next tick
+            return TickResult(1, f"combat_interrupt [attacked by {attacker_type}]",
+                            f"Chain paused: under attack by {attacker_type}. Instinct will handle combat next tick.",
+                            False)
 
         # ── Execute step ──
         tool_name = step["tool"]

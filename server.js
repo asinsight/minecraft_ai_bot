@@ -11,7 +11,9 @@ const BOT_CONFIG = {
   host: process.env.BOT_HOST || 'localhost',
   port: parseInt(process.env.BOT_PORT) || 57823,
   username: process.env.BOT_USERNAME || 'AIBot',
-  version: process.env.BOT_VERSION || '1.21.4'
+  version: process.env.BOT_VERSION || '1.21.4',
+  auth: process.env.BOT_AUTH || 'offline',
+  disableChatSigning: true
 }
 
 const API_PORT = parseInt(process.env.API_PORT) || 3001
@@ -26,15 +28,38 @@ let botReady = false
 let lastChatMessages = []
 let lastReadChatIndex = 0  // Track which messages agent has seen
 
+// ── Abort Flag (Python timeout → cancel long-running loops) ──
+let abortFlag = false
+
 // ── Death Tracking ──
 let deathLog = []
 let lastHealthSnapshot = { health: 20, food: 20, position: null, entities: [], time: null }
+let lastDeathMessage = ''  // Capture actual Minecraft death message
+
+// ── Combat Tracking ──
+let combatState = {
+  isUnderAttack: false,      // Currently being hit
+  lastHitTime: 0,            // timestamp of last damage taken
+  lastAttacker: null,        // { type, distance, position }
+  healthBefore: 20,          // health before last hit
+  healthDelta: 0,            // damage taken in last hit
+  recentAttacks: [],         // last 10 attacks [{type, damage, time, position}]
+  combatStartTime: 0,        // when combat began (0 = not in combat)
+}
 
 // ============================================
 // EXPRESS API SERVER
 // ============================================
 const app = express()
 app.use(express.json())
+
+// ── ABORT ENDPOINT ──
+app.post('/abort', (req, res) => {
+  console.log('[abort] Abort requested by Python agent')
+  abortFlag = true
+  try { bot.pathfinder.setGoal(null) } catch (e) {}
+  res.json({ success: true, message: 'Abort flag set' })
+})
 
 // ── STATE ENDPOINTS ──
 
@@ -180,10 +205,42 @@ app.get('/state', (req, res) => {
     isInWater,
     oxygenLevel,
     isUnderwater,
+    combat: {
+      isUnderAttack: combatState.isUnderAttack && (Date.now() - combatState.lastHitTime < 5000),
+      lastAttacker: combatState.lastAttacker,
+      healthDelta: combatState.healthDelta,
+      lastHitTime: combatState.lastHitTime,
+      timeSinceHit: combatState.lastHitTime ? Math.floor((Date.now() - combatState.lastHitTime) / 1000) : null,
+    },
     inventory,
     nearbyBlocks: blockNames,
     nearbyEntities,
     recentChat: lastChatMessages.slice(-10)
+  })
+})
+
+// GET /combat_status - Detailed combat state for agent decision-making
+app.get('/combat_status', (req, res) => {
+  if (!botReady) return res.status(503).json({ error: 'Bot not ready' })
+
+  // Refresh isUnderAttack based on time
+  const now = Date.now()
+  if (combatState.isUnderAttack && now - combatState.lastHitTime > 5000) {
+    combatState.isUnderAttack = false
+    combatState.combatStartTime = 0
+    combatState.lastAttacker = null
+  }
+
+  res.json({
+    isUnderAttack: combatState.isUnderAttack,
+    lastAttacker: combatState.lastAttacker,
+    healthDelta: combatState.healthDelta,
+    lastHitTime: combatState.lastHitTime,
+    timeSinceHit: combatState.lastHitTime ? Math.floor((now - combatState.lastHitTime) / 1000) : null,
+    combatDuration: combatState.combatStartTime ? Math.floor((now - combatState.combatStartTime) / 1000) : 0,
+    recentAttacks: combatState.recentAttacks,
+    health: bot.health,
+    food: bot.food,
   })
 })
 
@@ -659,6 +716,11 @@ app.post('/action/mine', async (req, res) => {
     }
 
     for (let i = 0; i < mineCount; i++) {
+      if (abortFlag) {
+        abortFlag = false
+        return res.json({ success: false, message: `Aborted after ${mined} ${block_type} (abort requested)` })
+      }
+
       const block = bot.findBlock({
         matching: b => b.name.includes(block_type),
         maxDistance: 64
@@ -1280,6 +1342,86 @@ app.post('/action/chat', (req, res) => {
   res.json({ success: true, message: `Sent: ${message}` })
 })
 
+// POST /action/flee - Run away from threats (independent flee action)
+app.post('/action/flee', async (req, res) => {
+  if (!botReady) return res.status(503).json({ error: 'Bot not ready' })
+  try {
+    const pos = bot.entity.position
+    const fleeDistance = req.body.distance || 30
+
+    // Find the most dangerous nearby hostile to flee FROM
+    const hostileNames = ['zombie', 'husk', 'skeleton', 'stray', 'spider', 'creeper',
+      'enderman', 'witch', 'drowned', 'phantom', 'pillager', 'vindicator', 'ravager',
+      'warden', 'blaze', 'wither_skeleton', 'piglin_brute', 'cave_spider']
+
+    const hostiles = Object.values(bot.entities)
+      .filter(e => e !== bot.entity && hostileNames.includes(e.name) && e.position.distanceTo(pos) < 20)
+      .sort((a, b) => a.position.distanceTo(pos) - b.position.distanceTo(pos))
+
+    if (hostiles.length === 0) {
+      return res.json({ success: true, message: 'No threats nearby, no need to flee' })
+    }
+
+    // Calculate average threat direction to flee AWAY from all hostiles
+    let threatDx = 0
+    let threatDz = 0
+    for (const h of hostiles) {
+      const dx = h.position.x - pos.x
+      const dz = h.position.z - pos.z
+      const dist = Math.sqrt(dx * dx + dz * dz) || 1
+      // Weight by inverse distance (closer = more weight)
+      const weight = 1 / dist
+      threatDx += (dx / dist) * weight
+      threatDz += (dz / dist) * weight
+    }
+
+    // Normalize and flee in opposite direction
+    const len = Math.sqrt(threatDx * threatDx + threatDz * threatDz) || 1
+    const fleeX = pos.x - (threatDx / len) * fleeDistance
+    const fleeZ = pos.z - (threatDz / len) * fleeDistance
+
+    bot.chat(`Fleeing from ${hostiles[0].name}!`)
+
+    // Sprint away
+    bot.setControlState('sprint', true)
+
+    try {
+      const mcData = require('minecraft-data')(bot.version)
+      const movements = new Movements(bot, mcData)
+      movements.canDig = false  // Don't waste time digging while fleeing
+      movements.scafoldingBlocks = []  // Don't waste blocks
+      bot.pathfinder.setMovements(movements)
+
+      const goal = new goals.GoalNear(fleeX, pos.y, fleeZ, 5)
+      const timeout = setTimeout(() => { bot.pathfinder.setGoal(null) }, 8000)
+      await bot.pathfinder.goto(goal)
+      clearTimeout(timeout)
+    } catch (e) {
+      // Even partial flee is better than nothing
+    }
+
+    bot.setControlState('sprint', false)
+
+    // Check if we actually got away
+    const newPos = bot.entity.position
+    const closestNow = hostiles
+      .filter(h => h.isValid)
+      .map(h => h.position.distanceTo(newPos))
+      .sort((a, b) => a - b)[0] || 999
+
+    const fled = closestNow > 10
+    const msg = fled
+      ? `Fled ${Math.floor(newPos.distanceTo(pos))}m from ${hostiles.length} hostile(s). Nearest threat now ${closestNow.toFixed(0)}m away.`
+      : `Tried to flee but threats still close (${closestNow.toFixed(0)}m). May need shelter.`
+
+    res.json({ success: fled, message: msg })
+  } catch (err) {
+    bot.setControlState('sprint', false)
+    bot.pathfinder.setGoal(null)
+    res.json({ success: false, message: `flee error: ${err.message}` })
+  }
+})
+
 // POST /action/escape_water - Escape from water to avoid drowning (3-phase)
 app.post('/action/escape_water', async (req, res) => {
   if (!botReady) return res.status(503).json({ error: 'Bot not ready' })
@@ -1637,6 +1779,11 @@ app.post('/action/dig_down', async (req, res) => {
     let currentPos = pos.clone()
 
     while (currentPos.y > targetY && dug < maxDepth * 4) {
+      if (abortFlag) {
+        abortFlag = false
+        return res.json({ success: false, message: `Aborted dig_down at y=${currentPos.y} after ${dug} blocks (abort requested)` })
+      }
+
       const dir = directions[dirIndex % 4]
 
       // Dig forward (2 blocks high for the player)
@@ -1737,6 +1884,14 @@ app.post('/action/dig_tunnel', async (req, res) => {
     const oresFound = {}
 
     for (let i = 0; i < tunnelLength; i++) {
+      if (abortFlag) {
+        abortFlag = false
+        const oreStr = Object.keys(oresFound).length > 0
+          ? ` Ores found: ${Object.entries(oresFound).map(([k,v]) => `${k}×${v}`).join(', ')}`
+          : ''
+        return res.json({ success: false, message: `Aborted tunnel after ${i} blocks, ${dug} mined (abort requested).${oreStr}` })
+      }
+
       const next = currentPos.offset(dir.x, 0, dir.z)
 
       // Dig 2-high tunnel (1x2)
@@ -1927,6 +2082,10 @@ app.post('/action/build_shelter', async (req, res) => {
     // STEP 2: Walls — layer by layer, bottom to top
     // This ensures each layer has reference blocks from the layer below
     for (let y = 0; y <= 2; y++) {
+      if (abortFlag) {
+        abortFlag = false
+        return res.json({ success: false, message: `Aborted build_shelter after ${placed} blocks placed (abort requested)` })
+      }
       // North wall (z = -S)
       for (let x = -S; x <= S; x++) {
         await placeAt(bx + x, by + y, bz - S)
@@ -2056,16 +2215,66 @@ bot.on('chat', (username, message) => {
   console.log(`💬 ${username}: ${message}`)
 })
 
-// ── Death Tracking: health snapshot every update ──
+// ── Death Tracking + Combat Detection: health snapshot every update ──
 bot.on('health', () => {
   const pos = bot.entity.position
   const nearbyEntities = Object.values(bot.entities)
     .filter(e => e !== bot.entity && e.position.distanceTo(pos) < 20)
     .map(e => ({
       type: e.name || e.username || 'unknown',
-      distance: parseFloat(e.position.distanceTo(pos).toFixed(1))
+      distance: parseFloat(e.position.distanceTo(pos).toFixed(1)),
+      position: { x: e.position.x.toFixed(1), y: e.position.y.toFixed(1), z: e.position.z.toFixed(1) }
     }))
     .sort((a, b) => a.distance - b.distance)
+
+  // ── Combat detection: health dropped = likely attacked ──
+  const prevHealth = lastHealthSnapshot.health ?? 20
+  const currentHealth = bot.health
+  const damage = prevHealth - currentHealth
+
+  if (damage > 0) {
+    // Health went DOWN — we're being attacked
+    const now = Date.now()
+
+    // Find most likely attacker: closest hostile mob
+    const hostileNames = ['zombie', 'husk', 'skeleton', 'stray', 'spider', 'creeper',
+      'enderman', 'witch', 'drowned', 'phantom', 'pillager', 'vindicator', 'ravager',
+      'warden', 'blaze', 'wither_skeleton', 'piglin_brute', 'cave_spider']
+    const attacker = nearbyEntities.find(e => hostileNames.includes(e.type))
+      || nearbyEntities.find(e => e.type !== 'item' && e.type !== 'experience_orb')
+
+    combatState.isUnderAttack = true
+    combatState.lastHitTime = now
+    combatState.healthBefore = prevHealth
+    combatState.healthDelta = damage
+    combatState.lastAttacker = attacker ? {
+      type: attacker.type,
+      distance: attacker.distance,
+      position: attacker.position
+    } : null
+
+    // Record to recent attacks (keep last 10)
+    combatState.recentAttacks.push({
+      type: attacker?.type || 'unknown',
+      damage: parseFloat(damage.toFixed(1)),
+      time: now,
+      position: { x: pos.x.toFixed(1), y: pos.y.toFixed(1), z: pos.z.toFixed(1) },
+      health_after: currentHealth
+    })
+    if (combatState.recentAttacks.length > 10) combatState.recentAttacks.shift()
+
+    // Set combat start time
+    if (!combatState.combatStartTime) combatState.combatStartTime = now
+
+    console.log(`⚔️ UNDER ATTACK! Damage: ${damage.toFixed(1)}, HP: ${currentHealth}/20, Attacker: ${attacker?.type || 'unknown'} (${attacker?.distance || '?'}m)`)
+  }
+
+  // Clear combat state if no damage for 5 seconds
+  if (combatState.isUnderAttack && Date.now() - combatState.lastHitTime > 5000) {
+    combatState.isUnderAttack = false
+    combatState.combatStartTime = 0
+    combatState.lastAttacker = null
+  }
 
   lastHealthSnapshot = {
     health: bot.health,
@@ -2080,27 +2289,128 @@ bot.on('health', () => {
   }
 })
 
+// ── Death cause categorization helper ──
+const HOSTILE_SET = new Set(['zombie', 'husk', 'skeleton', 'stray', 'spider', 'creeper',
+  'enderman', 'witch', 'drowned', 'phantom', 'pillager', 'vindicator', 'ravager',
+  'warden', 'blaze', 'wither_skeleton', 'piglin_brute', 'cave_spider'])
+
+function categorizeDeathMessage(msg) {
+  msg = msg.toLowerCase()
+  if (msg.includes('slain') || msg.includes('killed') || msg.includes('shot')) return 'combat'
+  if (msg.includes('drowned')) return 'drowning'
+  if (msg.includes('fell')) return 'fall'
+  if (msg.includes('burned') || msg.includes('lava')) return 'fire'
+  if (msg.includes('starved')) return 'starvation'
+  if (msg.includes('blew up') || msg.includes('blown up')) return 'explosion'
+  if (msg.includes('suffocated')) return 'suffocation'
+  if (msg.includes('withered')) return 'wither'
+  if (msg.includes('pricked') || msg.includes('poked')) return 'cactus'
+  return 'unknown'
+}
+
 // ── Death Tracking: capture death with pre-death snapshot ──
 bot.on('death', () => {
+  // Build death message from combat context — prioritized cause detection
+  let deathMessage = 'unknown cause'
+  let deathCategory = 'unknown'
+
+  // Priority 1: Recent combat (10 seconds) — most reliable indicator
+  if (combatState.lastAttacker && Date.now() - combatState.lastHitTime < 10000) {
+    deathMessage = `Killed by ${combatState.lastAttacker.type} (${combatState.lastAttacker.distance}m away)`
+    deathCategory = 'combat'
+    if (lastHealthSnapshot.food <= 0) {
+      deathMessage += ' (weakened by starvation)'
+    }
+  }
+  // Priority 2: Recent combat in attack history (30 seconds)
+  else if (combatState.recentAttacks.length > 0) {
+    const lastAttack = combatState.recentAttacks[combatState.recentAttacks.length - 1]
+    const timeSince = Date.now() - lastAttack.time
+    if (timeSince < 30000) {
+      deathMessage = `Likely killed by ${lastAttack.type} (${(timeSince / 1000).toFixed(0)}s ago)`
+      deathCategory = 'combat'
+      if (lastHealthSnapshot.food <= 0) {
+        deathMessage += ' (weakened by starvation)'
+      }
+    }
+  }
+  // Priority 3: Minecraft's actual death message from chat
+  if (deathCategory === 'unknown' && lastDeathMessage) {
+    deathMessage = lastDeathMessage
+    deathCategory = categorizeDeathMessage(lastDeathMessage)
+  }
+  // Priority 4: Nearby hostile mobs — probable combat
+  if (deathCategory === 'unknown' && lastHealthSnapshot.entities.length > 0) {
+    const hostiles = lastHealthSnapshot.entities.filter(e => HOSTILE_SET.has(e.type))
+    if (hostiles.length > 0) {
+      deathMessage = `Died near ${hostiles[0].type} (${hostiles[0].distance}m) — probable combat`
+      deathCategory = 'combat'
+    }
+  }
+  // Priority 5: Starvation (only if food was 0 and nothing else detected)
+  if (deathCategory === 'unknown' && lastHealthSnapshot.food <= 0) {
+    deathMessage = 'Starvation (hard mode) or starvation-weakened death'
+    deathCategory = 'starvation'
+  }
+
   const deathEntry = {
     timestamp: Date.now() / 1000,
-    message: 'death',
+    message: deathMessage,
+    category: deathCategory,
+    killed_by: combatState.lastAttacker?.type || null,
     health_before: lastHealthSnapshot.health,
     hunger_before: lastHealthSnapshot.food,
     position: lastHealthSnapshot.position,
     nearby_entities: lastHealthSnapshot.entities,
     time_of_day: lastHealthSnapshot.time,
+    recent_combat: combatState.recentAttacks.slice(-5),
   }
 
   deathLog.push(deathEntry)
   if (deathLog.length > 50) deathLog.shift()
 
   console.log('💀 Bot died!')
-  console.log(`   Last health: ${lastHealthSnapshot.health}/20`)
+  console.log(`   Cause: ${deathMessage}`)
+  console.log(`   Category: ${deathCategory}`)
+  console.log(`   Last health: ${lastHealthSnapshot.health}/20, Food: ${lastHealthSnapshot.food}/20`)
   console.log(`   Nearby: ${lastHealthSnapshot.entities.map(e => `${e.type}(${e.distance}m)`).join(', ') || 'none'}`)
   console.log(`   Time: ${lastHealthSnapshot.time}`)
 
+  // Reset combat state on death
+  combatState.isUnderAttack = false
+  combatState.combatStartTime = 0
+  combatState.lastAttacker = null
+  combatState.recentAttacks = []
+  lastDeathMessage = ''
+
   bot.chat('I died... respawning!')
+})
+
+// ── Capture actual Minecraft death messages from chat ──
+bot.on('messagestr', (message) => {
+  const botName = bot.username
+  if (message.includes(botName) && (
+    message.includes('slain by') || message.includes('was killed') ||
+    message.includes('was shot') || message.includes('blew up') ||
+    message.includes('was blown up') || message.includes('drowned') ||
+    message.includes('fell') || message.includes('burned') ||
+    message.includes('was pricked') || message.includes('suffocated') ||
+    message.includes('starved') || message.includes('withered')
+  )) {
+    lastDeathMessage = message
+    console.log(`💀 Death message captured: ${message}`)
+
+    // Race condition fix: update most recent death log entry if it was just created
+    if (deathLog.length > 0) {
+      const lastEntry = deathLog[deathLog.length - 1]
+      const timeSince = Date.now() / 1000 - lastEntry.timestamp
+      if (timeSince < 5) {
+        lastEntry.message = message
+        lastEntry.category = categorizeDeathMessage(message)
+        console.log(`   Updated death log with actual message`)
+      }
+    }
+  }
 })
 
 bot.on('error', (err) => console.log('❌ Error:', err.message))
