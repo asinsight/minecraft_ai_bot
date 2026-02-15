@@ -1,4 +1,4 @@
-# Minecraft Autonomous AI Bot (v6.4 — Log Analysis + Underground Fix)
+# Minecraft Autonomous AI Bot (v6.5 — Water/Drowning Survival)
 
 An autonomous Minecraft bot that sets a grand objective (like defeating the Ender Dragon) and **executes most actions without LLM calls** — using hardcoded action chains for known tasks, experience memory for learned solutions, and LLM only for high-level planning decisions.
 
@@ -123,6 +123,9 @@ Immediate survival reactions. Checked every tick before anything else.
 ```
 HP < 5 + has food     -> eat_food()           instant
 HP < 5 + no food      -> dig_shelter()        instant (sealed with blocks)
+In water + O2 <= 12   -> escape_water()       instant (swim up + find land)
+In water + O2 <= 5    -> escape_water()       instant (critical drowning)
+  (turtle_helmet      -> auto-equip, threshold lowered to O2 <= 5)
 Creeper within 5m     -> dig_shelter()        instant
 Warden detected       -> dig_shelter()        instant
 Night + surface       -> dig_shelter()        instant
@@ -346,6 +349,26 @@ Each chain gets a timeout calculated from its steps:
 Base: 120s + sum of step budgets. Clamped to 5-15 min range.
 
 Example: `make_iron_armor` (8 iron ore + 8 coal + smelt + craft + equip) = ~7 min timeout.
+
+### Water/Drowning Survival
+
+The bot detects water submersion and low oxygen, escaping automatically before drowning.
+
+```
+In water + oxygen <= 12 -> escape_water()  Layer 0 instinct (highest priority after HP)
+In water + oxygen < 10  -> escape_water()  Layer 1 mid-chain interrupt
+turtle_helmet available -> auto-equip, lower threshold to oxygen <= 5
+```
+
+**Escape strategy (3-phase):**
+
+| Phase | Action | When |
+|-------|--------|------|
+| Phase 1 | Swim up (jump) + dig blocks above if trapped | Always first |
+| Phase 2 | Find nearest land (15-block radius) + pathfind | After surfacing |
+| Phase 3 | Build pillar with inventory blocks | If Phase 1 fails (deep water) |
+
+**Mid-chain water awareness**: If the bot falls into water during a chain, the chain pauses while the bot escapes, then resumes next tick.
 
 ### Shelter Management
 
@@ -712,6 +735,7 @@ minecraft-bot/
 - [x] **TeeLogger — auto-save all output to logs/bot_*.log**
 - [x] **Log analyzer (analyze_logs.py) — chain stats, error patterns, stuck loops, recommendations**
 - [x] **CLAUDE.md — Claude Code auto-context for project analysis**
+- [x] **Water/Drowning survival — oxygen monitoring, 3-phase escape, turtle helmet support**
 - [ ] Nether navigation + portal building
 - [ ] Chest inventory management
 - [ ] Dynamic chain generation by LLM
@@ -720,4 +744,4 @@ minecraft-bot/
 
 **Author**: Jun
 **Created**: 2026-02-13
-**Version**: v6.4 -- Log Analysis + Underground Block Placement Fix
+**Version**: v6.5 -- Water/Drowning Survival System

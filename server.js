@@ -156,6 +156,14 @@ app.get('/state', (req, res) => {
 
   const isDark = blockLight < 8
 
+  // ── Water detection ──
+  const isInWater = bot.entity.isInWater || false
+  const oxygenLevel = bot.oxygenLevel ?? 20  // 0-20, 20 = full air
+  const eyePos = pos.offset(0, 1.62, 0)
+  const eyeBlock = bot.blockAt(eyePos.floored())
+  const isUnderwater = isInWater && eyeBlock &&
+    (eyeBlock.name === 'water' || eyeBlock.name === 'flowing_water')
+
   res.json({
     position: { x: pos.x.toFixed(1), y: pos.y.toFixed(1), z: pos.z.toFixed(1) },
     health: bot.health,
@@ -169,6 +177,9 @@ app.get('/state', (req, res) => {
     isDark,
     roofHeight: canSeeSky ? null : roofHeight,
     isRaining: bot.isRaining,
+    isInWater,
+    oxygenLevel,
+    isUnderwater,
     inventory,
     nearbyBlocks: blockNames,
     nearbyEntities,
@@ -1267,6 +1278,195 @@ app.post('/action/chat', (req, res) => {
   const { message } = req.body
   bot.chat(message)
   res.json({ success: true, message: `Sent: ${message}` })
+})
+
+// POST /action/escape_water - Escape from water to avoid drowning (3-phase)
+app.post('/action/escape_water', async (req, res) => {
+  if (!botReady) return res.status(503).json({ error: 'Bot not ready' })
+  try {
+    // Not in water? Nothing to do
+    if (!bot.entity.isInWater) {
+      return res.json({ success: true, message: 'Not in water, no action needed' })
+    }
+
+    bot.chat('Water detected! Escaping...')
+
+    // ── Phase 1: Swim up to surface ──
+    // Check if blocks above are blocking escape — dig them out first
+    for (let dy = 2; dy <= 4; dy++) {
+      const above = bot.blockAt(bot.entity.position.offset(0, dy, 0).floored())
+      if (above && above.name !== 'air' && above.name !== 'cave_air'
+          && above.name !== 'water' && above.name !== 'flowing_water'
+          && above.boundingBox === 'block') {
+        // Phase 3 preemptive: dig upward to clear path
+        if (above.diggable && above.name !== 'bedrock') {
+          bot.chat('Clearing blocks above to escape water...')
+          try { await bot.dig(above) } catch (e) { /* continue anyway */ }
+          const above2 = bot.blockAt(bot.entity.position.offset(0, dy + 1, 0).floored())
+          if (above2 && above2.diggable && above2.name !== 'bedrock'
+              && above2.name !== 'air' && above2.name !== 'water') {
+            try { await bot.dig(above2) } catch (e) { /* continue */ }
+          }
+        }
+        break
+      }
+    }
+
+    // Swim up by holding jump
+    bot.setControlState('jump', true)
+    // Also try sprinting in water for faster movement
+    bot.setControlState('sprint', true)
+
+    // Wait until head is above water or timeout (10s)
+    const swimStart = Date.now()
+    const swimTimeout = 10000
+    let escaped = false
+
+    await new Promise((resolve) => {
+      const check = setInterval(() => {
+        const eyePos = bot.entity.position.offset(0, 1.62, 0)
+        const eyeBlock = bot.blockAt(eyePos.floored())
+        const headClear = !eyeBlock ||
+          (eyeBlock.name !== 'water' && eyeBlock.name !== 'flowing_water')
+
+        if (headClear || !bot.entity.isInWater) {
+          escaped = true
+          clearInterval(check)
+          resolve()
+        } else if (Date.now() - swimStart > swimTimeout) {
+          clearInterval(check)
+          resolve()
+        }
+      }, 200)
+    })
+
+    bot.setControlState('jump', false)
+    bot.setControlState('sprint', false)
+
+    if (!escaped && bot.entity.isInWater) {
+      // ── Phase 3: Trapped underwater — try placing block under feet ──
+      const inv = bot.inventory.items()
+      const placeableBlocks = ['cobblestone', 'dirt', 'stone', 'netherrack',
+        'cobbled_deepslate', 'sand', 'gravel', 'oak_planks', 'spruce_planks',
+        'birch_planks', 'jungle_planks', 'acacia_planks', 'dark_oak_planks']
+      let blockItem = null
+      for (const name of placeableBlocks) {
+        blockItem = inv.find(i => i.name === name)
+        if (blockItem) break
+      }
+      if (!blockItem) blockItem = inv.find(i => i.stackSize > 1 && !i.name.includes('sword')
+        && !i.name.includes('pickaxe') && !i.name.includes('axe')
+        && !i.name.includes('shovel') && !i.name.includes('hoe'))
+
+      if (blockItem) {
+        // Build pillar upward to escape
+        bot.chat('Building pillar to escape water...')
+        for (let i = 0; i < 8; i++) {
+          if (!bot.entity.isInWater) break
+          const belowPos = bot.entity.position.offset(0, -1, 0).floored()
+          const belowBlock = bot.blockAt(belowPos)
+          if (belowBlock && (belowBlock.name === 'water' || belowBlock.name === 'flowing_water'
+              || belowBlock.name === 'air' || belowBlock.name === 'cave_air')) {
+            try {
+              // Find a reference block to place against
+              const refOffsets = [
+                new Vec3(0, -2, 0), new Vec3(1, -1, 0), new Vec3(-1, -1, 0),
+                new Vec3(0, -1, 1), new Vec3(0, -1, -1)
+              ]
+              for (const off of refOffsets) {
+                const refPos = bot.entity.position.offset(off.x, off.y, off.z).floored()
+                const refBlock = bot.blockAt(refPos)
+                if (refBlock && refBlock.boundingBox === 'block'
+                    && refBlock.name !== 'water' && refBlock.name !== 'flowing_water') {
+                  await bot.equip(blockItem, 'hand')
+                  const faceVec = belowPos.minus(refPos)
+                  await bot.placeBlock(refBlock, faceVec)
+                  bot.setControlState('jump', true)
+                  await new Promise(r => setTimeout(r, 400))
+                  bot.setControlState('jump', false)
+                  break
+                }
+              }
+            } catch (e) { /* continue trying */ }
+          }
+          // Jump up onto placed block
+          bot.setControlState('jump', true)
+          await new Promise(r => setTimeout(r, 500))
+          bot.setControlState('jump', false)
+        }
+      }
+
+      // Final check
+      if (bot.entity.isInWater) {
+        return res.json({ success: false, message: 'Could not fully escape water, still submerged' })
+      }
+    }
+
+    // ── Phase 2: Find and move to land ──
+    const pos = bot.entity.position
+    let bestLand = null
+    let bestDist = Infinity
+
+    for (let dx = -15; dx <= 15; dx += 1) {
+      for (let dz = -15; dz <= 15; dz += 1) {
+        for (let dy = 5; dy >= -3; dy--) {
+          const checkPos = pos.offset(dx, dy, dz).floored()
+          const block = bot.blockAt(checkPos)
+          if (!block || block.boundingBox !== 'block') continue
+          if (block.name === 'water' || block.name === 'flowing_water'
+              || block.name === 'lava' || block.name === 'flowing_lava') continue
+
+          const above1 = bot.blockAt(checkPos.offset(0, 1, 0))
+          const above2 = bot.blockAt(checkPos.offset(0, 2, 0))
+          if (!above1 || !above2) continue
+          if (above1.boundingBox === 'block' || above2.boundingBox === 'block') continue
+          // Must not be water above either
+          if (above1.name === 'water' || above1.name === 'flowing_water') continue
+
+          const dist = pos.distanceTo(checkPos)
+          if (dist < bestDist) {
+            bestDist = dist
+            bestLand = checkPos.offset(0, 1, 0) // stand ON the block
+          }
+        }
+      }
+    }
+
+    if (bestLand && bestDist > 2) {
+      try {
+        const mcData = require('minecraft-data')(bot.version)
+        const movements = new Movements(bot, mcData)
+        movements.canDig = false  // don't dig while escaping water
+        bot.pathfinder.setMovements(movements)
+        const goal = new goals.GoalBlock(bestLand.x, bestLand.y, bestLand.z)
+        await bot.pathfinder.goto(goal)
+        const endPos = bot.entity.position
+        bot.chat('Escaped water safely!')
+        return res.json({
+          success: true,
+          message: `Escaped water, moved to land at (${endPos.x.toFixed(1)}, ${endPos.y.toFixed(1)}, ${endPos.z.toFixed(1)})`
+        })
+      } catch (moveErr) {
+        // Pathfinding failed but we might still be out of water
+        if (!bot.entity.isInWater) {
+          return res.json({ success: true, message: 'Escaped water (pathfinding partial)' })
+        }
+        return res.json({ success: false, message: `Escaped surface but failed to reach land: ${moveErr.message}` })
+      }
+    }
+
+    // Already on land or close enough
+    const endPos = bot.entity.position
+    return res.json({
+      success: true,
+      message: `Escaped water at (${endPos.x.toFixed(1)}, ${endPos.y.toFixed(1)}, ${endPos.z.toFixed(1)})`
+    })
+
+  } catch (err) {
+    bot.setControlState('jump', false)
+    bot.setControlState('sprint', false)
+    return res.json({ success: false, message: `escape_water error: ${err.message}` })
+  }
 })
 
 // POST /action/dig_shelter - Emergency shelter: dig into ground and seal

@@ -91,7 +91,7 @@ def call_tool(tool_name: str, args: dict, timeout: int = 60) -> dict:
         if tool_name == "mine_block":
             count = int(args.get("count", 1))
             timeout = max(60, count * 8)  # ~8s per block (pathfind + dig + collect)
-        elif tool_name in ("dig_down", "dig_tunnel", "dig_shelter", "build_shelter"):
+        elif tool_name in ("dig_down", "dig_tunnel", "dig_shelter", "build_shelter", "escape_water"):
             timeout = 120
 
         endpoint_map = {
@@ -103,6 +103,7 @@ def call_tool(tool_name: str, args: dict, timeout: int = 60) -> dict:
             "eat_food": ("POST", "/action/eat", {}),
             "attack_entity": ("POST", "/action/attack", {"entity_type": args.get("entity_type", "")}),
             "dig_shelter": ("POST", "/action/dig_shelter", {}),
+            "escape_water": ("POST", "/action/escape_water", {}),
             "dig_down": ("POST", "/action/dig_down", {"depth": args.get("depth", 10), "target_y": args.get("target_y", 0)}),
             "dig_tunnel": ("POST", "/action/dig_tunnel", {"direction": args.get("direction", "north"), "length": args.get("length", 10)}),
             "build_shelter": ("POST", "/action/build_shelter", {}),
@@ -224,6 +225,26 @@ def check_instinct(state: dict, threat: dict) -> Optional[TickResult]:
             _last_shelter_time = time.time()
             result = call_tool("dig_shelter", {})
             return TickResult(0, "dig_shelter() [no food, critical HP]", result.get("message", ""), result.get("success", False))
+
+    # ── Drowning / Water escape ──
+    is_in_water = state.get("isInWater", False)
+    oxygen_level = state.get("oxygenLevel", 20)
+
+    if is_in_water and oxygen_level <= 12:
+        # Auto-equip turtle_helmet for water breathing if available
+        has_turtle_helmet = any(i["name"] == "turtle_helmet" for i in inventory)
+        if has_turtle_helmet:
+            call_tool("equip_item", {"item_name": "turtle_helmet", "destination": "head"})
+
+        # With turtle helmet, only escape at critical oxygen (gives water breathing)
+        oxygen_threshold = 5 if has_turtle_helmet else 12
+
+        if oxygen_level <= oxygen_threshold:
+            label = "drowning!" if oxygen_level <= 5 else "low oxygen"
+            print(f"   🌊 Water escape triggered: oxygen={oxygen_level}, inWater={is_in_water}")
+            result = call_tool("escape_water", {})
+            return TickResult(0, f"escape_water() [{label}]",
+                            result.get("message", ""), result.get("success", False))
 
     # ── Creeper very close ──
     for td in threat_details:
@@ -401,6 +422,15 @@ class ChainExecutor:
             name = chain.chain_name
             self.active_chain = None
             return TickResult(1, "chain_complete", f"Chain '{name}' completed (some steps skipped)!", True)
+
+        # ── Water awareness (Layer 1) ──
+        # If underwater with declining oxygen during chain, escape first
+        water_state = get_bot_state()
+        if water_state.get("isInWater") and water_state.get("oxygenLevel", 20) < 10:
+            print(f"   🌊 Underwater during chain (oxygen={water_state.get('oxygenLevel')}), escaping first...")
+            result = call_tool("escape_water", {})
+            return TickResult(1, "escape_water() [mid-chain]",
+                            result.get("message", ""), result.get("success", False))
 
         # ── Execute step ──
         tool_name = step["tool"]

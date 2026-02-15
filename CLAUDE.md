@@ -1,4 +1,4 @@
-# Minecraft Autonomous Bot v6.4
+# Minecraft Autonomous Bot v6.5
 
 ## Architecture
 
@@ -88,6 +88,7 @@ report에서 문제 tick 범위를 찾았으면, 원본 로그 파일에서 해�
 | 장비 미착용 | `chain_executor.py` `_auto_equip_best_gear` | tier 리스트 + 호출 시점 확인 |
 | move_to 경로 차단 | `server.js` `/action/move` + `chain_executor.py` | 장애물 자동 채굴 → 즉시 LLM escalation |
 | skipped task 미재시도 | `grand_goal.py` `pick_next_task` | MAX_SKIP_RETRIES, skip_retry_count 확인 |
+| 익사/물 빠짐 | `chain_executor.py` `check_instinct` + `server.js` `/action/escape_water` | Layer 0: oxygen ≤ 12 → escape_water, Layer 1: oxygen < 10 → 체인 중단 후 탈출 |
 
 ---
 
@@ -98,7 +99,7 @@ report에서 문제 tick 범위를 찾았으면, 원본 로그 파일에서 해�
 1. state, threat 가져오기 (GET /status, /threat_assessment)
 2. auto_check_progress (인벤토리 스캔 → task 자동 완료)
 3. auto_equip_best_gear (chain 시작 시)
-4. Layer 0: check_instinct → HP 낮음? 밤? 크리퍼? → 즉시 실행, return
+4. Layer 0: check_instinct → HP 낮음? 물? 밤? 크리퍼? → 즉시 실행, return
 5. death 체크 → 죽었으면 LLM 분석
 6. player chat → 있으면 Claude API 응답
 7. Layer 1: chain active? → execute_tick()
@@ -198,6 +199,7 @@ Slots: head, torso, legs, feet, hand (sword), off-hand (shield)
 - POST `/action/bridge` — 다리 건설
 - POST `/action/build_shelter` — 지상 셸터 (5x3x5 + 문)
 - POST `/action/dig_shelter` — 긴급 지하 셸터 (봉인)
+- POST `/action/escape_water` — 물 탈출 (3-phase: 수영상승 → 육지이동 → 블록배치)
 - POST `/action/explore` — 탐험 `{distance}`
 - POST `/action/seal_mineshaft` — 수직 갱도 봉인
 
@@ -209,7 +211,14 @@ Slots: head, torso, legs, feet, hand (sword), off-hand (shield)
 
 ## Version History
 
-### v6.4 (current)
+### v6.5 (current)
+- Water/Drowning 생존 시스템: 물 빠짐 감지 + 자동 탈출
+- /state에 isInWater, oxygenLevel, isUnderwater 필드 추가
+- /action/escape_water: 3-phase 탈출 (수영상승 → 육지이동 → 블록배치)
+- Layer 0: oxygen ≤ 12 → 자동 escape_water (turtle_helmet 착용 시 ≤ 5)
+- Layer 1: 체인 실행 중 oxygen < 10 → 체인 일시중단 후 탈출
+
+### v6.4
 - place_block: 4방향 → 9-position + dig-out fallback (지하 완전 지원)
 - _ensure_crafting_table: dirt only → stone 먼저 시도 (지하 호환)
 - _ensure_furnace: 배치 실패 시 공간 확보 retry 추가
