@@ -55,15 +55,18 @@ class GrandGoal:
 
     @property
     def is_complete(self) -> bool:
+        # ONLY actually completed tasks count — SKIPPED tasks are NOT done
         required = [t for t in self.tasks if not t.optional]
-        return all(t.status in (TaskStatus.COMPLETED, TaskStatus.SKIPPED) for t in required)
+        return all(t.status == TaskStatus.COMPLETED for t in required)
 
     @property
     def overall_progress(self) -> str:
         total = len(self.tasks)
-        done = sum(1 for t in self.tasks if t.status in (TaskStatus.COMPLETED, TaskStatus.SKIPPED))
+        done = sum(1 for t in self.tasks if t.status == TaskStatus.COMPLETED)
+        skipped = sum(1 for t in self.tasks if t.status == TaskStatus.SKIPPED)
         pct = int(done / total * 100) if total > 0 else 0
-        return f"{done}/{total} ({pct}%)"
+        skip_str = f", {skipped} skipped" if skipped else ""
+        return f"{done}/{total} ({pct}%{skip_str})"
 
     def refresh_availability(self):
         completed_ids = {t.id for t in self.tasks if t.status in (TaskStatus.COMPLETED, TaskStatus.SKIPPED)}
@@ -109,10 +112,18 @@ def check_block_nearby(block_name: str) -> bool:
         return False
 
 
+# Items that are commonly placed as blocks — check both inventory AND nearby blocks
+PLACEABLE_ITEM_BLOCKS = {"crafting_table", "furnace", "chest", "trapped_chest",
+                         "barrel", "anvil", "smithing_table", "cartography_table",
+                         "brewing_stand", "enchanting_table", "bed"}
+
 def check_task_completion(task: Task, inventory: dict[str, int]) -> bool:
     if task.completion_items:
         for item_name, required_count in task.completion_items.items():
             if inventory.get(item_name, 0) < required_count:
+                # Fallback: if this item can be a placed block, check nearby
+                if item_name in PLACEABLE_ITEM_BLOCKS and check_block_nearby(item_name):
+                    continue  # block is placed nearby, counts as complete
                 return False
     if task.completion_blocks_placed:
         for block_name in task.completion_blocks_placed:
@@ -128,9 +139,17 @@ def check_task_completion(task: Task, inventory: dict[str, int]) -> bool:
 # ============================================
 
 class GoalLibrary:
-    """Manages goal_library.json — stores, retrieves, and searches goal templates."""
+    """Manages goal libraries — default (builtin, read-only) + custom (LLM/user-created).
 
-    FILE = "goal_library.json"
+    Two files:
+      - default_goal_library.json: 3 built-in goals (auto-seeded, never modified by LLM)
+      - custom_goal_library.json:  LLM/user-created goals (read-write)
+
+    Both are loaded and merged into self.goals for unified access.
+    """
+
+    DEFAULT_FILE = "default_goal_library.json"
+    CUSTOM_FILE = "custom_goal_library.json"
 
     VALID_CHAINS = {
         "get_wood", "mine_stone", "make_crafting_table", "make_wooden_pickaxe",
@@ -138,34 +157,66 @@ class GoalLibrary:
         "make_iron_armor", "make_shield", "make_bucket", "mine_diamonds",
         "make_diamond_pickaxe", "make_diamond_sword", "find_food",
         "build_shelter", "place_furnace", "place_chest",
+        "mine_diamonds_bulk", "make_diamond_armor", "equip_diamond_gear",
     }
 
     def __init__(self):
-        self.goals: dict[str, dict] = {}
+        self.default_goals: dict[str, dict] = {}
+        self.custom_goals: dict[str, dict] = {}
+        self.goals: dict[str, dict] = {}  # merged view (default + custom)
         self._load()
 
     def _load(self):
+        # ── Load default goals ──
         try:
-            if os.path.exists(self.FILE):
-                with open(self.FILE, "r") as f:
-                    self.goals = json.load(f)
-                print(f"📚 Loaded {len(self.goals)} goals from library")
+            if os.path.exists(self.DEFAULT_FILE):
+                with open(self.DEFAULT_FILE, "r", encoding="utf-8") as f:
+                    self.default_goals = json.load(f)
             else:
                 self._seed_builtin_goals()
         except (json.JSONDecodeError, IOError) as e:
-            print(f"⚠️ goal_library.json corrupted ({e}), re-seeding...")
+            print(f"⚠️ {self.DEFAULT_FILE} corrupted ({e}), re-seeding...")
             self._seed_builtin_goals()
 
-    def _save(self):
+        # ── Load custom goals ──
         try:
-            with open(self.FILE, "w") as f:
-                json.dump(self.goals, f, indent=2, ensure_ascii=False)
+            if os.path.exists(self.CUSTOM_FILE):
+                with open(self.CUSTOM_FILE, "r", encoding="utf-8") as f:
+                    self.custom_goals = json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"⚠️ {self.CUSTOM_FILE} corrupted ({e}), starting empty")
+            self.custom_goals = {}
+
+        # ── Migrate from old goal_library.json if new files didn't exist ──
+        old_file = "goal_library.json"
+        if not self.custom_goals and os.path.exists(old_file):
+            try:
+                with open(old_file, "r", encoding="utf-8") as f:
+                    old_goals = json.load(f)
+                builtin_names = set(self.default_goals.keys())
+                migrated = {k: v for k, v in old_goals.items() if k not in builtin_names}
+                if migrated:
+                    self.custom_goals = migrated
+                    self._save_custom()
+                    print(f"📚 Migrated {len(migrated)} custom goals from old goal_library.json")
+            except Exception:
+                pass
+
+        # ── Merge: default + custom (custom overrides default if name clash) ──
+        self.goals = {**self.default_goals, **self.custom_goals}
+        print(f"📚 Loaded {len(self.default_goals)} default + {len(self.custom_goals)} custom goals")
+
+    def _save_custom(self):
+        """Save only custom goals to custom_goal_library.json."""
+        try:
+            with open(self.CUSTOM_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.custom_goals, f, indent=2, ensure_ascii=False)
         except Exception as e:
-            print(f"⚠️ Failed to save goal library: {e}")
+            print(f"⚠️ Failed to save custom goal library: {e}")
 
     def _seed_builtin_goals(self):
-        """Create goal_library.json with the 3 built-in goals."""
-        self.goals = {
+        """Create default_goal_library.json with the 3 built-in goals."""
+        self.default_goals = {
             "defeat_ender_dragon": {
                 "name": "defeat_ender_dragon",
                 "description": "Defeat the Ender Dragon!",
@@ -318,8 +369,12 @@ class GoalLibrary:
                 ],
             },
         }
-        self._save()
-        print(f"📚 Seeded goal library with {len(self.goals)} built-in goals")
+        try:
+            with open(self.DEFAULT_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.default_goals, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"⚠️ Failed to save default goal library: {e}")
+        print(f"📚 Seeded {len(self.default_goals)} built-in goals")
 
     # ── Goal Retrieval ──
 
@@ -369,32 +424,40 @@ class GoalLibrary:
         errors = self._validate_goal(name, tasks)
         if errors:
             return f"Validation failed: {'; '.join(errors)}"
-        self.goals[name] = {
+        goal_data = {
             "name": name,
             "description": description,
             "source": source,
             "phases": phases,
             "tasks": tasks,
         }
-        self._save()
-        return f"Goal '{name}' saved ({len(tasks)} tasks)"
+        # Always save to custom file (never modify default)
+        self.custom_goals[name] = goal_data
+        self.goals[name] = goal_data  # update merged view
+        self._save_custom()
+        return f"Goal '{name}' saved to custom library ({len(tasks)} tasks)"
 
     # ── Similarity Search ──
 
     def find_similar(self, description: str) -> list[str]:
-        desc_words = set(description.lower().split())
+        # Filter out common stop words for better matching
+        stop_words = {"a", "an", "the", "and", "or", "get", "make", "build",
+                      "full", "set", "of", "with", "for", "to", "in", "all"}
+        desc_words = set(description.lower().split()) - stop_words
         if not desc_words:
             return []
         scores = []
         for name, data in self.goals.items():
-            goal_words = set(data["description"].lower().split())
-            goal_words.update(name.lower().replace("_", " ").split())
-            overlap = len(desc_words & goal_words)
-            if overlap > 0:
-                score = overlap / max(len(desc_words), len(goal_words))
-                scores.append((name, score))
+            goal_words = set(data["description"].lower().split()) - stop_words
+            goal_words.update(set(name.lower().replace("_", " ").split()) - stop_words)
+            overlap = desc_words & goal_words
+            if overlap:
+                # Score based on meaningful word overlap
+                score = len(overlap) / max(len(desc_words), len(goal_words))
+                scores.append((name, score, overlap))
         scores.sort(key=lambda x: -x[1])
-        return [name for name, score in scores if score > 0.2]
+        # Higher threshold (0.3) and require at least 1 meaningful keyword match
+        return [name for name, score, overlap in scores if score > 0.3]
 
     # ── Validation ──
 
@@ -419,11 +482,16 @@ class GoalLibrary:
             seen_ids.add(tid)
 
             chain = t.get("chain_name", "")
-            if chain and chain not in self.VALID_CHAINS:
-                errors.append(
-                    f"Task '{tid}' has invalid chain_name '{chain}'. "
-                    f"Valid: {', '.join(sorted(self.VALID_CHAINS))}"
-                )
+            if chain:
+                # Check both default and custom chains
+                from chain_library import _get_custom_lib
+                custom_names = set(_get_custom_lib().list_chain_names())
+                all_valid = self.VALID_CHAINS | custom_names
+                if chain not in all_valid:
+                    errors.append(
+                        f"Task '{tid}' has invalid chain_name '{chain}'. "
+                        f"Valid: {', '.join(sorted(all_valid))}"
+                    )
 
             for req in t.get("requires", []):
                 if req not in all_task_ids:
@@ -731,7 +799,7 @@ class GrandGoalManager:
         lines = [f"🏆 GRAND GOAL: {goal.description} ({goal.overall_progress})"]
         for phase in goal.phases:
             phase_tasks = goal.get_tasks_by_phase(phase.id)
-            done = sum(1 for t in phase_tasks if t.status in (TaskStatus.COMPLETED, TaskStatus.SKIPPED))
+            done = sum(1 for t in phase_tasks if t.status == TaskStatus.COMPLETED)
             lines.append(f"  📋 {phase.name} [{done}/{len(phase_tasks)}]")
             for task in phase_tasks:
                 icon = {"completed": "✅", "skipped": "⏭️", "available": "⬜",

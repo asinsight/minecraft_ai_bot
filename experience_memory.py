@@ -54,36 +54,150 @@ class ExperienceMemory:
 
     # ── Search Success ──
 
+    MAX_LOCATIONS_PER_RESOURCE = 5
+
     def record_search_success(self, target: str, method: str,
                                location: Optional[dict] = None):
         """Record that a search target was found using a specific method.
 
+        Stores multiple locations per resource (up to MAX_LOCATIONS_PER_RESOURCE).
+        Oldest locations are evicted when the limit is reached.
+
         Args:
             target: What was being searched for (e.g., "iron_ore")
             method: How it was found (e.g., "dig_down:32", "dig_tunnel:north:20")
-            location: Where it was found {x, y, z}
+            location: Where it was found {x, y, z} — should always be provided
         """
-        key = target
-        existing = self.search_successes.get(key, {})
-        self.search_successes[key] = {
-            "method": method,
-            "location": location,
+        existing = self.search_successes.get(target, {})
+        locations = existing.get("locations", [])
+
+        # Migrate old single-location format
+        if not locations and existing.get("location"):
+            old_loc = existing["location"]
+            if old_loc:
+                locations.append({**old_loc, "method": existing.get("method", "unknown"),
+                                  "found_at": existing.get("last_used", time.time())})
+
+        # Add new location if provided and not too close to existing ones
+        if location:
+            too_close = False
+            for loc in locations:
+                dx = float(location.get("x", 0)) - float(loc.get("x", 0))
+                dy = float(location.get("y", 0)) - float(loc.get("y", 0))
+                dz = float(location.get("z", 0)) - float(loc.get("z", 0))
+                if (dx**2 + dy**2 + dz**2) ** 0.5 < 16:  # within 16 blocks = same area
+                    too_close = True
+                    loc["method"] = method  # update method for this spot
+                    loc["found_at"] = time.time()
+                    break
+            if not too_close:
+                locations.append({
+                    "x": float(location.get("x", 0)),
+                    "y": float(location.get("y", 0)),
+                    "z": float(location.get("z", 0)),
+                    "method": method,
+                    "found_at": time.time(),
+                })
+                # Evict oldest if over limit
+                if len(locations) > self.MAX_LOCATIONS_PER_RESOURCE:
+                    locations.sort(key=lambda l: l.get("found_at", 0))
+                    locations = locations[-self.MAX_LOCATIONS_PER_RESOURCE:]
+
+        self.search_successes[target] = {
+            "method": method,  # most recent method (for backward compat)
+            "locations": locations,
             "success_count": existing.get("success_count", 0) + 1,
             "last_used": time.time(),
         }
         self._save()
-        print(f"🧠 Remembered: {target} found via {method}")
+        loc_str = f" at ({location['x']:.0f}, {location['y']:.0f}, {location['z']:.0f})" if location else ""
+        print(f"🧠 Remembered: {target} found via {method}{loc_str} ({len(locations)} known locations)")
 
-    def get_search_hint(self, target: str) -> Optional[dict]:
-        """Get a past successful search method for a target.
+    def remove_location(self, target: str, location: dict):
+        """Remove a depleted location from memory.
 
-        Returns:
-            dict with "method" and optionally "location", or None
+        Called when scouting a remembered location finds no resources there.
+        Removes any stored location within 16 blocks of the given coordinates.
         """
         entry = self.search_successes.get(target)
-        if entry:
-            return entry
-        return None
+        if not entry:
+            return
+        locations = entry.get("locations", [])
+        if not locations:
+            return
+
+        lx = float(location.get("x", 0))
+        ly = float(location.get("y", 0))
+        lz = float(location.get("z", 0))
+
+        new_locations = []
+        removed = False
+        for loc in locations:
+            dx = lx - float(loc.get("x", 0))
+            dy = ly - float(loc.get("y", 0))
+            dz = lz - float(loc.get("z", 0))
+            if (dx**2 + dy**2 + dz**2) ** 0.5 < 16:
+                removed = True  # skip this one
+            else:
+                new_locations.append(loc)
+
+        if removed:
+            if new_locations:
+                entry["locations"] = new_locations
+            else:
+                # No locations left — remove the entire entry
+                del self.search_successes[target]
+            self._save()
+            print(f"🧠 Forgot depleted location for {target} at ({lx:.0f}, {ly:.0f}, {lz:.0f})")
+
+    def get_search_hint(self, target: str, bot_position: Optional[dict] = None) -> Optional[dict]:
+        """Get a past successful search location for a target.
+
+        If bot_position is provided, returns the nearest known location.
+        Otherwise returns the most recently found location.
+
+        Returns:
+            dict with "method", "location", "distance" or None
+        """
+        entry = self.search_successes.get(target)
+        if not entry:
+            return None
+
+        locations = entry.get("locations", [])
+        if not locations:
+            # Backward compat: old format had single "location" field
+            if entry.get("location"):
+                return {"method": entry["method"], "location": entry["location"]}
+            return {"method": entry["method"], "location": None}
+
+        if bot_position:
+            # Return nearest location
+            bx = float(bot_position.get("x", 0))
+            by = float(bot_position.get("y", 0))
+            bz = float(bot_position.get("z", 0))
+            best = None
+            best_dist = float("inf")
+            for loc in locations:
+                dx = bx - float(loc.get("x", 0))
+                dy = by - float(loc.get("y", 0))
+                dz = bz - float(loc.get("z", 0))
+                dist = (dx**2 + dy**2 + dz**2) ** 0.5
+                if dist < best_dist:
+                    best_dist = dist
+                    best = loc
+            if best:
+                return {
+                    "method": best.get("method", entry["method"]),
+                    "location": {"x": best["x"], "y": best["y"], "z": best["z"]},
+                    "distance": round(best_dist, 1),
+                }
+
+        # No bot position — return most recent
+        most_recent = max(locations, key=lambda l: l.get("found_at", 0))
+        return {
+            "method": most_recent.get("method", entry["method"]),
+            "location": {"x": most_recent["x"], "y": most_recent["y"], "z": most_recent["z"]},
+        }
 
     # ── Error Solutions ──
 
@@ -217,10 +331,10 @@ class ExperienceMemory:
         lines = []
         if target and target in self.search_successes:
             s = self.search_successes[target]
-            lines.append(f"Past success finding {target}: {s['method']} (worked {s['success_count']}x)")
-            if s.get("location"):
-                loc = s["location"]
-                lines.append(f"  Last found at: ({loc.get('x','?')}, {loc.get('y','?')}, {loc.get('z','?')})")
+            locations = s.get("locations", [])
+            lines.append(f"Past success finding {target}: {s['method']} (worked {s['success_count']}x, {len(locations)} known locations)")
+            for loc in locations[-3:]:  # show last 3
+                lines.append(f"  Found at: ({loc.get('x','?'):.0f}, {loc.get('y','?'):.0f}, {loc.get('z','?'):.0f}) via {loc.get('method','?')}")
 
         combat_summary = self.get_combat_summary()
         if combat_summary:

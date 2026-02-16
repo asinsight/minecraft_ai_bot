@@ -1,4 +1,4 @@
-# Minecraft Autonomous AI Bot (v6.8 — Abort Mechanism)
+# Minecraft Autonomous AI Bot (v7.0 — Cave Intelligence + Chest Looting)
 
 An autonomous Minecraft bot that sets a grand objective (like defeating the Ender Dragon) and **executes most actions without LLM calls** — using hardcoded action chains for known tasks, experience memory for learned solutions, and LLM only for high-level planning decisions.
 
@@ -24,9 +24,12 @@ An autonomous Minecraft bot that sets a grand objective (like defeating the Ende
 |    - Death snapshot tracking                       |
 |    - Shelter: build (surface, with door)            |
 |               or dig (underground, sealed)          |
-|    - Directional mining (staircase, tunnel)        |
+|    - Directional mining (staircase, tunnel, branch) |
 |    - Block placement (9-pos + dig-out fallback)     |
 |    - Smart pathfinding (auto-mine obstacles)       |
+|    - Lava detection + water bucket neutralize      |
+|    - Unreachable block skip (failedPositions)      |
+|    - tunnelMove helper (reliable underground nav)  |
 |    - Item/block search via minecraft-data          |
 +--------------------------------------------------+
 |                 HTTP (localhost:3001)              |
@@ -37,12 +40,18 @@ An autonomous Minecraft bot that sets a grand objective (like defeating the Ende
 |      |                                             |
 |      +-- Layer 0: INSTINCT (no LLM, instant)      |
 |      |   HP < 5 -> eat. Night -> shelter. Flee.    |
+|      |   Shield block. Inventory full -> store.    |
 |      |                                             |
 |      +-- Layer 1: CHAIN EXECUTION (no LLM, fast)  |
 |      |   chain_executor.py  Step-by-step actions   |
 |      |   chain_library.py   Hardcoded chains (20)  |
 |      |   experience_memory.py Learned solutions    |
-|      |   - Auto-save locations (crafting, shelter)  |
+|      |   - Cave-first search (scan -> memory ->    |
+|      |     dig/explore fallback)                   |
+|      |   - Chest looting (dungeon/ruin chests)     |
+|      |   - Crafting table/furnace carry            |
+|      |   - Auto-save locations (craft, shelter,    |
+|      |     caves)                                  |
 |      |   - Experience check before escalation      |
 |      |   - Dynamic timeout scaling per chain       |
 |      |   - Shelter limit (max 3 saved)             |
@@ -71,6 +80,7 @@ An autonomous Minecraft bot that sets a grand objective (like defeating the Ende
 |      |                                             |
 |      +-- Spatial Memory - Remember places          |
 |      |   spatial_memory.py waypoints.json          |
+|      |   Shelters, crafting, furnace, caves         |
 |      |                                             |
 |      +-- Tools (29) ---- Perception, actions       |
 |          tools.py         (for LLM Layer 2 only)   |
@@ -127,8 +137,8 @@ HP < 5 + no food      -> dig_shelter()        instant (sealed with blocks)
 In water + O2 <= 12   -> escape_water()       instant (swim up + find land)
 In water + O2 <= 5    -> escape_water()       instant (critical drowning)
   (turtle_helmet      -> auto-equip, threshold lowered to O2 <= 5)
-Sudden HP drop (>=4)  -> fight/flee           instant (based on threat rec)
-Under attack          -> fight/flee/avoid     instant (based on threat rec)
+Sudden HP drop (>=4)  -> shield + fight/flee  instant (based on threat rec)
+Under attack          -> shield + fight/flee  instant (ranged mobs -> shield first)
 Creeper within 5m     -> flee()               instant (faster than shelter)
 Warden detected       -> flee()               instant
 Flee recommendation   -> flee() or shelter    instant
@@ -138,6 +148,8 @@ Night + surface       -> dig_shelter()        instant
 Dusk + surface        -> dig_shelter()        instant
 Hungry (food < 5)     -> eat_food()           instant
 Mob inside shelter    -> attack_entity()      instant
+Inventory full        -> store_items()        instant (if chest nearby)
+Nearby drops          -> collect_drops()      instant (if safe)
 ```
 
 No LLM call. No chain. Pure `if/else` in Python.
@@ -153,7 +165,7 @@ Hardcoded action sequences for known Minecraft tasks. Executed step-by-step by P
   mine_block(coal_ore, 3)      # search type
   mine_block(stone, 8)         # for furnace
   craft_item(furnace)          # deterministic
-  place_block(furnace)         # deterministic - 6-dir safe placement
+  place_block(furnace)         # deterministic - 9-pos safe placement
   smelt_item(raw_iron, 3)      # deterministic
   craft_item(stick)            # deterministic
   craft_item(iron_pickaxe)     # deterministic
@@ -163,13 +175,17 @@ Hardcoded action sequences for known Minecraft tasks. Executed step-by-step by P
 
 **Smart features:**
 - **Auto-skip**: Already have cobblestone? Skip the mining step.
-- **Search strategies**: `iron_ore` not found nearby? -> check memory -> dig_down(32) -> dig_tunnel(north, 20) -> dig_tunnel(east, 20) -- all without LLM.
+- **Cave-first search**: Scan for caves -> check spatial memory for known caves -> dig_down/tunnel fallback. Caves have exposed ores!
+- **Search strategies**: `iron_ore` not found? -> check memory -> cave scan -> dig_down(32) -> dig_tunnel(north, 20) -- all without LLM.
+- **Chest looting**: After exploring/digging, auto-detect dungeon/ruin chests within 16 blocks and loot valuables.
+- **Crafting table/furnace carry**: Pick up placed crafting table and furnace after use (no waste).
 - **Experience memory**: "Last time I found iron_ore at y=32 by digging down" -> try that first next time.
 - **Auto-fix**: "No crafting table nearby" -> craft one -> place it -> retry. No LLM needed.
 - **Auto-fix**: "No space to place block" (underground) -> mine adjacent block to clear space -> retry.
-- **Auto-save locations**: Crafting table, furnace, shelter positions saved to spatial memory on placement.
-- **Dynamic timeouts**: Each chain gets a timeout calculated from its steps (mine_block: 10s/block, smelt: 12s/item, etc). Range: 5-15 min.
+- **Auto-save locations**: Crafting table, furnace, shelter, cave positions saved to spatial memory.
+- **Dynamic timeouts**: Each chain gets a timeout calculated from its steps (mine_block: 10s/block, smelt: 12s/item, dig_down: depth-based). Range: 5-15 min.
 - **Shelter limit**: Only 3 most recent shelters saved (old ones auto-deleted).
+- **Unreachable block skip**: If a block can't be reached, skip it and find the next one (failedPositions tracking).
 
 ### Layer 2: LLM Planning (Only When Needed)
 
@@ -244,11 +260,12 @@ Chain step fails -> unknown error
 |         | (if no chat)
 +- 5. Layer 1: Chain -------- active chain? -> execute next step
 |     |   +- Step succeeds -> advance
-|     |   +- Step fails (search) -> try search strategy
+|     |   +- Step fails (search) -> cave-first strategy + search strategies
 |     |   +- Step fails -> check experience for saved solution
 |     |   +- Step fails (known fix) -> auto-fix (clear space, craft table, etc.)
 |     |   +- Step fails (movement) -> mine obstacle -> escalate to LLM
 |     |   +- Step fails 3x (unknown) -> escalate to Layer 2 -> save solution
+|     |   +- After explore/dig -> loot nearby chests
 |     | (if no active chain)
 +- 6. Layer 2: Planning ----- need new chain
       +- Grand Goal has next task with known chain?
@@ -268,6 +285,7 @@ Step fails
   +- craft: "no crafting table" -> craft + place one -> retry
   +- craft: "no furnace" -> craft + place one -> retry
   +- mine: "need pickaxe" -> inject make_pickaxe chain -> resume
+  +- mine: "unreachable block" -> skip, find next block (failedPositions)
   +- move_to: "path blocked" -> mine obstacle -> escalate to LLM immediately
   |
   +- Retry 3 times -> escalate to LLM
@@ -278,9 +296,9 @@ Step fails
   |     -> Skipped tasks retried after other tasks complete (up to 2 retries)
 ```
 
-### Search Strategy: 3-Phase Resource Finding
+### Search Strategy: Cave-First Resource Finding
 
-When a search-type step fails ("no iron_ore found nearby"), the system uses a 3-phase search before calling the LLM:
+When a search-type step fails ("no iron_ore found nearby"), the system uses a cave-first strategy with 3-phase fallback:
 
 ```
 mine_block(iron_ore, 3) FAILED: "No iron_ore found nearby"
@@ -288,6 +306,19 @@ mine_block(iron_ore, 3) FAILED: "No iron_ore found nearby"
   +- Phase 0: Experience memory
   |     -> "iron_ore was found at (80, 32, -60) last time"
   |     -> move_to(80, 32, -60) -> retry mine_block -> Success!
+  |
+  +- Cave-First Strategy (before each persistent search attempt):
+  |     Step 1: Scan for NEW caves (GET /scan_caves, radius 32)
+  |       -> Cave found (size >= 5 blocks)? -> move_to(cave center)
+  |       -> Already explored? -> skip (chunk-level dedup)
+  |       -> Save to spatial_memory for future recall
+  |
+  |     Step 2: Check remembered caves (spatial_memory)
+  |       -> Known caves sorted by distance -> visit nearest unvisited
+  |       -> Max range: 200 blocks
+  |
+  |     Step 3: Fallback (no caves available)
+  |       -> dig_down / dig_tunnel / explore (original strategy)
   |
   +- Phase 1: Static search strategies (resource-specific, 6-11 steps)
   |     -> find_block(iron_ore, 64) -> not found
@@ -297,13 +328,15 @@ mine_block(iron_ore, 3) FAILED: "No iron_ore found nearby"
   |     -> dig_tunnel(south/west, 20) -> explore(40) -> dig_down(16) -> tunnels...
   |
   +- Phase 2: Persistent search (up to 8 dynamic attempts)
+  |     Cave scan before EVERY attempt (cave-first!)
   |     For ores: alternating dig_down(optimal Y) + dig_tunnel(rotating directions, longer each time)
   |     For surface: explore(30, 45, 60, 75... up to 120)
   |     After each attempt -> find_block(target, 32) -> mine if found
+  |     After each explore/dig -> loot nearby chests (dungeons!)
   |
   +- Phase 3: LLM escalation (only after ~19 total attempts)
         "Cannot find iron_ore after 19 search attempts.
-         Tried: dig_down, dig_tunnel (all directions), explore.
+         Tried: caves, dig_down, dig_tunnel (all directions), explore.
          Analyze what went wrong and try a DIFFERENT approach."
 ```
 
@@ -311,30 +344,66 @@ Each resource has its own static strategy:
 
 | Resource | Static Strategy Steps | Persistent Search |
 |----------|----------------------|-------------------|
-| `oak_log` | find_block -> birch/spruce -> explore(30/50/80) | explore(30→120) |
-| `stone` | find_block -> dig_down(5) -> tunnel | explore(30→120) |
-| `iron_ore` | find_block -> memory -> dig_down(32) -> tunnels N/E/S/W -> explore -> dig_down(16) -> tunnels (11 steps) | dig_down(16) + tunnels (rotating) |
-| `coal_ore` | find_block -> memory -> dig_down(48) -> tunnels W/N -> explore -> dig_down(40) -> tunnels E/S (9 steps) | dig_down(48) + tunnels |
-| `diamond_ore` | find_block -> deepslate -> memory -> dig_down(-58) -> tunnels all dirs -> explore -> more tunnels (12 steps) | dig_down(-58) + tunnels |
-| Animals | explore(30/50/80/60/100) | explore(30→120) |
+| `oak_log` | find_block -> birch/spruce -> explore(30/50/80) | explore(30->120) |
+| `stone` | find_block -> dig_down(5) -> tunnel | explore(30->120) |
+| `iron_ore` | find_block -> memory -> dig_down(32) -> tunnels N/E/S/W -> explore -> dig_down(16) -> tunnels (11 steps) | cave scan + dig_down(16) + tunnels (rotating) |
+| `coal_ore` | find_block -> memory -> dig_down(48) -> tunnels W/N -> explore -> dig_down(40) -> tunnels E/S (9 steps) | cave scan + dig_down(48) + tunnels |
+| `diamond_ore` | find_block -> deepslate -> memory -> dig_down(-58) -> tunnels all dirs -> explore -> more tunnels (12 steps) | cave scan + dig_down(-58) + tunnels |
+| Animals | explore(30/50/80/60/100) | explore(30->120) |
+
+### Chest Looting (Dungeon/Ruin Discovery)
+
+During exploration and mining, the bot automatically detects and loots wild chests (dungeons, ruins, mineshafts):
+
+```
+After explore/dig_down/dig_tunnel/branch_mine:
+  |
+  +- Scan for chest/trapped_chest within 16 blocks
+  +- Skip bot-placed chests (spatial_memory has "chest" category)
+  +- Move to wild chest -> open_chest -> inspect contents
+  +- Filter valuables (diamonds, emeralds, enchanted books, equipment, etc.)
+  +- Retrieve valuable items -> save position as "looted_chest"
+  +- Continue search
+```
+
+**Valuable items**: diamonds, emeralds, gold/iron ingots, enchanted books, name tags, saddles, golden apples, diamond/iron equipment, bows, arrows, shields, and more.
+
+### Crafting Table & Furnace Carry
+
+The bot picks up crafting tables and furnaces after use instead of leaving them in the world:
+
+```
+craft_item(iron_pickaxe) at crafting table
+  |
+  +- Craft succeeds
+  +- Is this the last craft step in the chain?
+  |    -> Yes: mine_block(crafting_table) -> carry it
+  |    -> No: leave for next craft step
+  |
+smelt_item(raw_iron) at furnace
+  |
+  +- Smelt succeeds
+  +- Is this the last smelt step?
+  |    -> Yes: mine_block(furnace) -> carry it
+```
 
 ### Skipped Task Retry
 
 Tasks that fail 5 times are skipped temporarily, not permanently. The system retries them after other tasks complete:
 
 ```
-Task "make_iron_armor" fails 5 times → SKIPPED
+Task "make_iron_armor" fails 5 times -> SKIPPED
   |
   +- Other tasks continue (make_shield, make_bucket, etc.)
   |
-  +- All other tasks done → RETRY skipped tasks
+  +- All other tasks done -> RETRY skipped tasks
   |     Reset fail count to 0, get 5 more chain attempts
   |
-  +- Retry 1/2: fails again → SKIPPED again
+  +- Retry 1/2: fails again -> SKIPPED again
   |
   +- Retry 2/2: final retry
   |
-  +- Still failing → permanently SKIPPED (goal completes without it)
+  +- Still failing -> permanently SKIPPED (goal completes without it)
 ```
 
 This prevents one hard task from blocking all progress while still giving it multiple chances.
@@ -347,7 +416,9 @@ Each chain gets a timeout calculated from its steps:
 |-----------|------------|
 | `mine_block` | 10s per block (includes search) |
 | `smelt_item` | 12s per item |
-| `dig_down`, `build_shelter` | 120s |
+| `dig_down` | dynamic: max(120s, depth * 4s) |
+| `build_shelter` | 120s |
+| `branch_mine` | 300s |
 | `craft_item`, `place_block`, `equip_item` | 15s |
 | Other | 30s |
 
@@ -403,9 +474,9 @@ GET /threat_assessment
 | `avoid` | Don't engage -- flee if hostile within 6m |
 | `flee` | flee() immediately, shelter as fallback |
 
-**During combat**: auto-equip best weapon, chase target, eat if HP < 8, flee if HP <= 4, avoid creepers, run from Wardens, collect drops.
+**During combat**: auto-equip best weapon + shield, chase target, eat if HP < 8, flee if HP <= 4, avoid creepers, run from Wardens, shield block against ranged mobs, collect drops.
 
-### Real-Time Attack Detection (v6.6)
+### Real-Time Attack Detection
 
 ```
 bot.on('health') -> HP decreased?
@@ -418,7 +489,8 @@ bot.on('health') -> HP decreased?
 GET /combat_status -> { isUnderAttack, lastAttacker, healthDelta, recentAttacks }
   |
 check_instinct (every tick):
-  +- Under attack? -> auto-equip weapon -> fight/flee/avoid (based on rec)
+  +- Under attack? -> auto-equip weapon + shield -> fight/flee/avoid (based on rec)
+  +- Ranged mob? -> shield_block first, then attack
   +- HP dropped >= 4 in one tick? -> emergency response
   +- Chain running? -> interrupt chain, let instinct handle next tick
 ```
@@ -454,10 +526,10 @@ The bot automatically equips the best available gear at key moments:
 |------|------|
 | Chain start | All slots: sword, armor (head/torso/legs/feet), shield |
 | Chain complete | All slots (newly crafted gear equipped immediately) |
-| Before mining | Best pickaxe (diamond > iron > stone > wooden) |
-| Before combat | Best sword + in instinct layer too |
+| Before mining | Best pickaxe (diamond > iron > stone > wooden), skip if <10% durability |
+| Before combat | Best sword + shield (in instinct layer too) |
 
-**Tier priority** (high → low): Diamond > Iron > Chainmail > Leather. Old gear returns to inventory automatically.
+**Tier priority** (high -> low): Diamond > Iron > Chainmail > Leather. Old gear returns to inventory automatically.
 
 ### Block Placement (9-Position + Dig-Out Fallback)
 
@@ -465,9 +537,9 @@ The bot automatically equips the best available gear at key moments:
 place_block("crafting_table")
   |
   +- Phase 1: Try 9 candidate positions around bot
-  |     Priority 1: feet-level horizontal (4 dirs) — works on surface
-  |     Priority 2: head-level horizontal (4 dirs) — works in caves
-  |     Priority 3: above head (1 pos) — works in vertical shafts
+  |     Priority 1: feet-level horizontal (4 dirs) -- works on surface
+  |     Priority 2: head-level horizontal (4 dirs) -- works in caves
+  |     Priority 3: above head (1 pos) -- works in vertical shafts
   |     For each: find air block -> find solid reference -> calculate face vector -> place
   |     Skip bot's feet + head positions as reference
   |
@@ -479,7 +551,7 @@ place_block("crafting_table")
   +- Auto-save location to spatial memory (crafting_table, furnace, etc.)
 ```
 
-**Why 9 positions?** After `dig_down`, bot is in a 1x1 vertical shaft — all 4 horizontal blocks at feet level are stone. But head-level or above-head positions may have air from the shaft the bot dug through.
+**Why 9 positions?** After `dig_down`, bot is in a 1x1 vertical shaft -- all 4 horizontal blocks at feet level are stone. But head-level or above-head positions may have air from the shaft the bot dug through.
 
 ### Smart Pathfinding (Auto-Mine Obstacles)
 
@@ -494,7 +566,26 @@ move_to(x, y, z) FAILED: "Path blocked"
         -> LLM picks alternate route or strategy
 ```
 
-### Abort Mechanism (v6.8)
+### Tunnel Navigation (tunnelMove)
+
+Underground movement (dig_down, dig_tunnel, branch_mine) uses a specialized `tunnelMove()` helper:
+
+```
+tunnelMove(target)
+  |
+  +- Try pathfinder.goto(GoalNear(target, 1))
+  |     5s timeout to prevent stuck pathfinder
+  |
+  +- Pathfinder fails? -> manual movement fallback
+  |     lookAt(target) -> walk forward 800ms -> stop
+  |
+  +- Always use bot.entity.position.floored() for actual position
+  |     (never assume arrival based on target coordinates)
+```
+
+**Why?** Underground pathfinding often fails in tight 2x1 tunnels. The manual walkforward fallback ensures progress. Using actual bot position prevents phantom position tracking bugs.
+
+### Abort Mechanism
 
 Long-running server actions (mining 32 blocks, digging tunnels) can outlive the Python HTTP timeout. Previously this caused pathfinder collisions and infinite retry loops.
 
@@ -513,14 +604,14 @@ Python call_tool("mine_block", count=32, timeout=256s)
 Next API call is safe (no pathfinder conflict)
 ```
 
-**Abort checks in**: `/action/mine`, `/action/dig_down`, `/action/dig_tunnel`, `/action/build_shelter`
+**Abort checks in**: `/action/mine`, `/action/dig_down`, `/action/dig_tunnel`, `/action/build_shelter`, `/action/branch_mine`
 
 ### Spatial Memory
 
-Persisted in `waypoints.json` (max 3 shelters):
+Persisted in `waypoints.json`:
 
 ```
-KNOWN LOCATIONS (6):
+KNOWN LOCATIONS (8):
   [CRAFTING]
     crafting_table: (105, 64, -48) (12m)
     furnace: (107, 64, -48) (14m)
@@ -530,9 +621,14 @@ KNOWN LOCATIONS (6):
     shelter_48: (13, 69, -8) (22m)
   [STORAGE]
     chest: (15, 58, -7) (8m)
+  [CAVE]
+    cave_1: (120, 32, -80) (45m) - size 15
+    cave_2: (85, 48, -120) (90m) - size 8
 ```
 
-**Auto-saved** (Layer 1 + Layer 2): crafting table, chest, furnace, bed, shelter.
+**Auto-saved** (Layer 1 + Layer 2): crafting table, chest, furnace, bed, shelter, caves (max 10), looted chests.
+
+**Cave memory**: Discovered caves are saved with position + size. On next ore search, nearest unvisited cave is prioritized over blind tunneling.
 
 ---
 
@@ -543,11 +639,11 @@ All bot output is automatically saved to `logs/bot_YYYYMMDD_HHMMSS.log` via TeeL
 ### Workflow
 
 ```
-1. Run bot          python agent.py              → logs/bot_*.log (auto)
-2. Analyze          python analyze_logs.py       → report.md
-3. Claude Code      Read report.md               → diagnose issues
-4. Deep dive        Read specific tick range      → identify root cause
-5. Fix              Edit code based on analysis   → re-run bot
+1. Run bot          python agent.py              -> logs/bot_*.log (auto)
+2. Analyze          python analyze_logs.py       -> report.md
+3. Claude Code      Read report.md               -> diagnose issues
+4. Deep dive        Read specific tick range      -> identify root cause
+5. Fix              Edit code based on analysis   -> re-run bot
 ```
 
 ### Analyzer Features
@@ -571,12 +667,12 @@ python analyze_logs.py --last 500         # Last 500 ticks only
 `CLAUDE.md` at project root is automatically read by Claude Code on session start. Contains:
 - Architecture overview, key files, data files
 - Log analysis workflow (4-step)
-- Common issues → fix locations table
+- Common issues -> fix locations table
 - REST API endpoint list
 
 ---
 
-## Grand Goals: Dynamic Goal Library (v6.7)
+## Grand Goals: Dynamic Goal Library
 
 Goals are stored in `goal_library.json` (file-based, persistent). The bot ships with 3 built-in goals, but players can request custom goals via chat, and the LLM can create new ones dynamically.
 
@@ -662,7 +758,7 @@ The planning LLM can create new goals using any combination of 17 available chai
 | Grand goal progress | `grand_goal_state.json` | Yes |
 | Goal library (built-in + custom goals) | `goal_library.json` | Yes |
 | Death lessons | `death_lessons.json` | Yes |
-| Saved locations | `waypoints.json` | Yes |
+| Saved locations (shelters, caves, etc.) | `waypoints.json` | Yes |
 | Experience memory (search + errors + combat) | `experience.json` | Yes |
 | Bot execution logs | `logs/bot_*.log` | Yes |
 | Analysis report | `report.md` | Yes (overwritten) |
@@ -740,18 +836,19 @@ minecraft-bot/
 |
 +-- agent.py               # [Python] Main 3-layer tick loop + dual LLM routing
 +-- chain_library.py       # Hardcoded action chains + search strategies (20 chains)
-+-- chain_executor.py      # Layer 0+1 execution engine + auto-fix + experience check
++-- chain_executor.py      # Layer 0+1 execution engine + auto-fix + cave search + chest loot
 +-- experience_memory.py   # Remember what worked (search, errors, combat encounters)
 |
 +-- tools.py               # 29 LangChain tools (for LLM Layer 2 only)
 |
 +-- grand_goal.py          # Grand goal dependency graph + GoalLibrary (file-based)
 +-- grand_goal_tools.py    # LangChain tools for goal management (legacy)
++-- goal_planner.py        # Task priority + step state tracking
 |
 +-- death_analyzer.py      # Death snapshot capture + lesson extraction
 +-- death_tools.py         # LangChain tools for death learning
 |
-+-- spatial_memory.py      # Named waypoint storage (max 3 shelters)
++-- spatial_memory.py      # Named waypoint storage (shelters, caves, looted chests)
 +-- memory_tools.py        # LangChain tools for location memory
 |
 +-- analyze_logs.py       # Log analyzer -> report.md
@@ -760,7 +857,7 @@ minecraft-bot/
 +-- grand_goal_state.json  # [Auto] Saved goal progress
 +-- goal_library.json      # [Auto] Goal library (3 built-in + custom goals)
 +-- death_lessons.json     # [Auto] Persistent death lessons
-+-- waypoints.json         # [Auto] Persistent saved locations
++-- waypoints.json         # [Auto] Persistent saved locations (shelters, caves, chests)
 +-- experience.json        # [Auto] Persistent experience data
 +-- report.md              # [Auto] Latest analysis report
 +-- logs/                  # [Auto] Bot execution logs
@@ -772,23 +869,25 @@ minecraft-bot/
 
 ---
 
-## Performance: v3 vs v6.8
+## Performance: v3 vs v7.0
 
-| Metric | v3 (LLM every tick) | v6.8 (Dual LLM + Chain) |
+| Metric | v3 (LLM every tick) | v7.0 (Dual LLM + Chain) |
 |--------|--------------------|--------------------|
 | LLM calls per minute | ~12 | ~0.3 |
 | Time per action | 5-15s (LLM thinking) | 1-2s (direct API) |
 | Actions per minute | ~4-6 | ~20-30 |
 | Iron pickaxe time | ~15-30 min | ~3-5 min |
 | Memory between ticks | None | Chain state + history |
-| Resource search | LLM guesses | 3-phase systematic (up to 19 attempts) |
+| Resource search | LLM guesses | Cave-first + 3-phase systematic (19+ attempts) |
 | Error recovery | LLM every time | Experience-first, LLM fallback |
 | Same error twice | LLM again | Auto-handled from experience |
 | Player chat | Same slow LLM | Claude API (fast, natural) |
-| Failed tasks | Stuck forever | Skip → retry later (up to 2 retries) |
+| Failed tasks | Stuck forever | Skip -> retry later (up to 2 retries) |
 | Gear management | Manual | Auto-equip best gear at key moments |
-| Combat response | None | Real-time attack detect → fight/flee/avoid |
+| Combat response | None | Real-time attack detect -> fight/flee/avoid + shield |
 | Combat memory | None | Record outcomes, track danger zones |
+| Dungeon loot | None | Auto-detect and loot wild chests |
+| Cave exploration | None | Scan + remember + revisit caves |
 
 ---
 
@@ -813,43 +912,54 @@ minecraft-bot/
 - [x] **Experience memory (persistent)**
 - [x] **Auto-skip + auto-fix in chains**
 - [x] **Auto-inventory task completion**
-- [x] Smart combat AI
+- [x] Smart combat AI + shield blocking
 - [x] Threat assessment engine
 - [x] Furnace smelting
 - [x] Emergency shelter (sealed) + surface shelter (with door)
-- [x] Directional mining
+- [x] Directional mining (staircase, tunnel, branch mine)
 - [x] Death analysis + lesson learning
-- [x] Spatial memory (max 3 shelters)
+- [x] Spatial memory (shelters, caves, chests)
 - [x] Structure scan + rebuild
-- [x] **6-direction safe block placement**
-- [x] **Auto-save locations from Layer 1 (crafting table, furnace, shelter)**
+- [x] **9-position block placement + dig-out fallback (underground fix)**
+- [x] **Auto-save locations from Layer 1 (crafting table, furnace, shelter, cave)**
 - [x] **LLM solution capture -> experience memory (learning loop)**
 - [x] **Smart pathfinding (auto-mine obstacles)**
 - [x] **Dynamic timeout scaling per chain complexity**
 - [x] **Claude API for player conversation (dual LLM)**
 - [x] **Bot state in LLM context (HP, food, position, time)**
 - [x] **Dedicated chains: mine_stone, place_furnace, place_chest**
-- [x] **Auto-equip best gear (armor, weapon, shield) at chain start/end/combat**
+- [x] **Auto-equip best gear (armor, weapon, shield) + durability check**
 - [x] **Skipped task retry system (up to 2 retries after other tasks complete)**
-- [x] **3-phase resource search (static → persistent → LLM escalation)**
+- [x] **3-phase resource search (static -> persistent -> LLM escalation)**
 - [x] **Persistent search mode (8 dynamic explore/dig attempts before LLM)**
-- [x] **9-position block placement + dig-out fallback (underground fix)**
-- [x] **TeeLogger — auto-save all output to logs/bot_*.log**
-- [x] **Log analyzer (analyze_logs.py) — chain stats, error patterns, stuck loops, recommendations**
-- [x] **CLAUDE.md — Claude Code auto-context for project analysis**
-- [x] **Water/Drowning survival — oxygen monitoring, 3-phase escape, turtle helmet support**
-- [x] **Combat response system — real-time attack detection, fight/flee/avoid, chain interruption**
-- [x] **Combat experience memory — record outcomes, danger zones, LLM context enrichment**
-- [x] **Flee action — sprint away from threats (separate from shelter)**
-- [x] **Real death message capture — actual Minecraft death messages instead of hardcoded**
-- [x] **Dynamic Grand Goal system — file-based GoalLibrary, user chat -> custom goals, LLM creates tasks**
-- [x] **Goal priority system — user-requested goals override auto-selected goals**
-- [x] **Abort mechanism — Python timeout -> POST /abort -> server stops long-running loops cleanly**
+- [x] **TeeLogger -- auto-save all output to logs/bot_*.log**
+- [x] **Log analyzer (analyze_logs.py) -- chain stats, error patterns, stuck loops, recommendations**
+- [x] **CLAUDE.md -- Claude Code auto-context for project analysis**
+- [x] **Water/Drowning survival -- oxygen monitoring, 3-phase escape, turtle helmet support**
+- [x] **Combat response system -- real-time attack detection, fight/flee/avoid, chain interruption**
+- [x] **Combat experience memory -- record outcomes, danger zones, LLM context enrichment**
+- [x] **Flee action -- sprint away from threats (separate from shelter)**
+- [x] **Real death message capture -- actual Minecraft death messages instead of hardcoded**
+- [x] **Dynamic Grand Goal system -- file-based GoalLibrary, user chat -> custom goals**
+- [x] **Goal priority system -- user-requested goals override auto-selected goals**
+- [x] **Abort mechanism -- Python timeout -> POST /abort -> server stops long-running loops**
+- [x] **Lava detection + water bucket neutralization (preemptive scan)**
+- [x] **Stuck detection -- 3-tick position tracking, dig_down/explore to unstick**
+- [x] **Inventory management -- emptySlots check, auto store_items to chest**
+- [x] **Tool durability tracking -- <10% auto-switch to next tier**
+- [x] **Cave detection + cave-first search strategy -- scan/remember/revisit caves**
+- [x] **Cave spatial memory -- save discovered caves, sort by distance, max 10**
+- [x] **Drop collection -- entityDead event, collect_drops instinct**
+- [x] **Chest looting -- auto-detect dungeon/ruin chests, loot valuables**
+- [x] **Crafting table/furnace carry -- pick up after use, no waste**
+- [x] **Unreachable block skip -- failedPositions tracking in mine endpoint**
+- [x] **tunnelMove helper -- reliable underground navigation with fallback**
 - [ ] Nether navigation + portal building
-- [ ] Chest inventory management
+- [ ] Enchanting workflow
+- [ ] Villager trading
 
 ---
 
 **Author**: Jun
 **Created**: 2026-02-13
-**Version**: v6.8 -- Abort Mechanism
+**Version**: v7.0 -- Cave Intelligence + Chest Looting

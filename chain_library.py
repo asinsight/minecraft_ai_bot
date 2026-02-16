@@ -193,7 +193,7 @@ CHAIN_LIBRARY = {
     "make_wooden_pickaxe": [
         # Ensure we have planks + sticks
         {"tool": "mine_block", "args": {"block_type": "oak_log", "count": 2},
-         "type": "search", "skip_if": {"oak_planks": 3, "wooden_pickaxe": 1},
+         "type": "search", "skip_if": {"oak_log": 2, "oak_planks": 3, "wooden_pickaxe": 1},
          "search_target": "oak_log"},
         {"tool": "craft_item", "args": {"item_name": "oak_planks"},
          "type": "craft", "skip_if": {"oak_planks": 3, "wooden_pickaxe": 1}},
@@ -247,7 +247,7 @@ CHAIN_LIBRARY = {
 
     "place_chest": [
         {"tool": "mine_block", "args": {"block_type": "oak_log", "count": 2},
-         "type": "search", "skip_if": {"oak_planks": 8},
+         "type": "search", "skip_if": {"oak_log": 2, "oak_planks": 8},
          "search_target": "oak_log"},
         {"tool": "craft_item", "args": {"item_name": "oak_planks"},
          "type": "craft", "skip_if": {"oak_planks": 8}},
@@ -259,7 +259,7 @@ CHAIN_LIBRARY = {
 
     "build_shelter": [
         {"tool": "mine_block", "args": {"block_type": "oak_log", "count": 2},
-         "type": "search", "skip_if": {"oak_planks": 6, "oak_door": 1},
+         "type": "search", "skip_if": {"oak_log": 2, "oak_planks": 6, "oak_door": 1},
          "search_target": "oak_log"},
         {"tool": "craft_item", "args": {"item_name": "oak_planks"},
          "type": "craft", "skip_if": {"oak_planks": 6, "oak_door": 1}},
@@ -359,6 +359,31 @@ CHAIN_LIBRARY = {
     # ═══════════════════════════════════════════
 
     "mine_diamonds": [
+        # Ensure iron pickaxe BEFORE digging deep (on surface where iron is accessible)
+        {"tool": "mine_block", "args": {"block_type": "iron_ore", "count": 3},
+         "type": "search", "skip_if": {"raw_iron": 3, "iron_ingot": 3, "iron_pickaxe": 1, "diamond_pickaxe": 1},
+         "search_target": "iron_ore"},
+        {"tool": "mine_block", "args": {"block_type": "coal_ore", "count": 3},
+         "type": "search", "skip_if": {"coal": 3, "charcoal": 3, "iron_pickaxe": 1, "diamond_pickaxe": 1},
+         "search_target": "coal_ore"},
+        {"tool": "mine_block", "args": {"block_type": "stone", "count": 8},
+         "type": "search", "skip_if": {"cobblestone": 8, "furnace": 1, "iron_pickaxe": 1, "diamond_pickaxe": 1},
+         "search_target": "stone"},
+        {"tool": "craft_item", "args": {"item_name": "furnace"},
+         "type": "craft", "skip_if": {"furnace": 1, "iron_pickaxe": 1, "diamond_pickaxe": 1},
+         "skip_if_nearby": "furnace"},
+        {"tool": "place_block", "args": {"block_name": "furnace"},
+         "type": "place", "skip_if": {"iron_pickaxe": 1, "diamond_pickaxe": 1},
+         "skip_if_nearby": "furnace"},
+        {"tool": "smelt_item", "args": {"item_name": "raw_iron", "count": 3},
+         "type": "craft", "skip_if": {"iron_ingot": 3, "iron_pickaxe": 1, "diamond_pickaxe": 1}},
+        {"tool": "craft_item", "args": {"item_name": "stick"},
+         "type": "craft", "skip_if": {"stick": 2, "iron_pickaxe": 1, "diamond_pickaxe": 1}},
+        {"tool": "craft_item", "args": {"item_name": "iron_pickaxe"},
+         "type": "craft", "skip_if": {"iron_pickaxe": 1, "diamond_pickaxe": 1}},
+        {"tool": "equip_item", "args": {"item_name": "iron_pickaxe"},
+         "type": "action"},
+        # Now dig to diamond level with proper tools
         {"tool": "dig_down", "args": {"target_y": -58},
          "type": "action"},
         {"tool": "dig_tunnel", "args": {"direction": "north", "length": 30},
@@ -386,6 +411,74 @@ CHAIN_LIBRARY = {
          "type": "action"},
     ],
 
+    "mine_diamonds_bulk": [
+        # Ensure iron pickaxe BEFORE deep mining
+        {"tool": "mine_block", "args": {"block_type": "iron_ore", "count": 3},
+         "type": "search", "skip_if": {"raw_iron": 3, "iron_ingot": 3, "iron_pickaxe": 1, "diamond_pickaxe": 1},
+         "search_target": "iron_ore"},
+        {"tool": "mine_block", "args": {"block_type": "coal_ore", "count": 3},
+         "type": "search", "skip_if": {"coal": 3, "charcoal": 3, "iron_pickaxe": 1, "diamond_pickaxe": 1},
+         "search_target": "coal_ore"},
+        {"tool": "mine_block", "args": {"block_type": "stone", "count": 8},
+         "type": "search", "skip_if": {"cobblestone": 8, "furnace": 1, "iron_pickaxe": 1, "diamond_pickaxe": 1},
+         "search_target": "stone"},
+        {"tool": "craft_item", "args": {"item_name": "furnace"},
+         "type": "craft", "skip_if": {"furnace": 1, "iron_pickaxe": 1, "diamond_pickaxe": 1},
+         "skip_if_nearby": "furnace"},
+        {"tool": "place_block", "args": {"block_name": "furnace"},
+         "type": "place", "skip_if": {"iron_pickaxe": 1, "diamond_pickaxe": 1},
+         "skip_if_nearby": "furnace"},
+        {"tool": "smelt_item", "args": {"item_name": "raw_iron", "count": 3},
+         "type": "craft", "skip_if": {"iron_ingot": 3, "iron_pickaxe": 1, "diamond_pickaxe": 1}},
+        {"tool": "craft_item", "args": {"item_name": "stick"},
+         "type": "craft", "skip_if": {"stick": 2, "iron_pickaxe": 1, "diamond_pickaxe": 1}},
+        {"tool": "craft_item", "args": {"item_name": "iron_pickaxe"},
+         "type": "craft", "skip_if": {"iron_pickaxe": 1, "diamond_pickaxe": 1}},
+        {"tool": "equip_item", "args": {"item_name": "iron_pickaxe"},
+         "type": "action"},
+        # Dig to diamond level and mine extensively
+        {"tool": "dig_down", "args": {"target_y": -58},
+         "type": "action"},
+        {"tool": "dig_tunnel", "args": {"direction": "north", "length": 50},
+         "type": "action"},
+        # Mine 26 diamonds (full armor set + sword)
+        {"tool": "mine_block", "args": {"block_type": "diamond_ore", "count": 26},
+         "type": "search", "skip_if": {"diamond": 26},
+         "search_target": "diamond_ore"},
+    ],
+
+    "make_diamond_armor": [
+        {"tool": "craft_item", "args": {"item_name": "diamond_helmet"},
+         "type": "craft", "skip_if": {"diamond_helmet": 1}},
+        {"tool": "craft_item", "args": {"item_name": "diamond_chestplate"},
+         "type": "craft", "skip_if": {"diamond_chestplate": 1}},
+        {"tool": "craft_item", "args": {"item_name": "diamond_leggings"},
+         "type": "craft", "skip_if": {"diamond_leggings": 1}},
+        {"tool": "craft_item", "args": {"item_name": "diamond_boots"},
+         "type": "craft", "skip_if": {"diamond_boots": 1}},
+        {"tool": "equip_item", "args": {"item_name": "diamond_helmet", "destination": "head"},
+         "type": "action"},
+        {"tool": "equip_item", "args": {"item_name": "diamond_chestplate", "destination": "torso"},
+         "type": "action"},
+        {"tool": "equip_item", "args": {"item_name": "diamond_leggings", "destination": "legs"},
+         "type": "action"},
+        {"tool": "equip_item", "args": {"item_name": "diamond_boots", "destination": "feet"},
+         "type": "action"},
+    ],
+
+    "equip_diamond_gear": [
+        {"tool": "equip_item", "args": {"item_name": "diamond_sword"},
+         "type": "action"},
+        {"tool": "equip_item", "args": {"item_name": "diamond_helmet", "destination": "head"},
+         "type": "action"},
+        {"tool": "equip_item", "args": {"item_name": "diamond_chestplate", "destination": "torso"},
+         "type": "action"},
+        {"tool": "equip_item", "args": {"item_name": "diamond_leggings", "destination": "legs"},
+         "type": "action"},
+        {"tool": "equip_item", "args": {"item_name": "diamond_boots", "destination": "feet"},
+         "type": "action"},
+    ],
+
     # ═══════════════════════════════════════════
     # EMERGENCY / INSTINCT CHAINS
     # ═══════════════════════════════════════════
@@ -404,14 +497,31 @@ CHAIN_LIBRARY = {
 }
 
 
+# Lazy-loaded custom chain library (initialized on first use)
+_custom_chain_lib = None
+
+def _get_custom_lib():
+    """Get the custom chain library singleton (lazy init)."""
+    global _custom_chain_lib
+    if _custom_chain_lib is None:
+        from custom_chain_library import CustomChainLibrary
+        _custom_chain_lib = CustomChainLibrary()
+    return _custom_chain_lib
+
+
 def get_chain(chain_name: str) -> list[dict]:
-    """Get a copy of a chain from the library."""
+    """Get a copy of a chain from the default or custom library.
+    Default chains take priority (custom cannot override default)."""
+    # Check default library first
     chain = CHAIN_LIBRARY.get(chain_name)
-    if chain is None:
-        return []
-    # Deep copy so we don't mutate the library
-    import copy
-    return copy.deepcopy(chain)
+    if chain is not None:
+        import copy
+        return copy.deepcopy(chain)
+    # Check custom chains
+    custom_chain = _get_custom_lib().get_chain(chain_name)
+    if custom_chain is not None:
+        return custom_chain  # already deep-copied
+    return []
 
 
 def get_search_strategy(target: str) -> list[tuple]:
@@ -420,5 +530,7 @@ def get_search_strategy(target: str) -> list[tuple]:
 
 
 def list_available_chains() -> list[str]:
-    """List all chain names available in the library."""
-    return list(CHAIN_LIBRARY.keys())
+    """List all chain names available (default + custom)."""
+    names = list(CHAIN_LIBRARY.keys())
+    names.extend(_get_custom_lib().list_chain_names())
+    return names

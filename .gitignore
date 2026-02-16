@@ -1,6 +1,8 @@
 .env
 *.json
+!default_goal_library.json
 node_modules/
 __pycache__/
 .claude/
 *.log
+CLAUDE.md

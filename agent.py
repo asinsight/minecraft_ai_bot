@@ -40,7 +40,7 @@ from langchain_core.messages import HumanMessage, AIMessage
 from chain_executor import ChainExecutor, check_instinct, get_bot_state, get_threat_assessment, TickResult
 from chain_library import get_chain, list_available_chains
 from experience_memory import ExperienceMemory
-from grand_goal import GrandGoalManager, TaskStatus
+from grand_goal import GrandGoalManager, TaskStatus, get_inventory_counts
 from death_analyzer import DeathAnalyzer
 from spatial_memory import SpatialMemory
 from tools import ALL_TOOLS
@@ -70,6 +70,9 @@ spatial_memory = SpatialMemory()
 chain_executor = ChainExecutor(experience, goal_manager)
 _consecutive_blocked = 0  # counter for consecutive "All tasks blocked" ticks
 _pending_goal_request: Optional[str] = None  # Chat Agent → Planning Agent bridge
+_instinct_fail_streak = 0          # consecutive failures of the same instinct
+_last_failed_instinct_key = ""     # e.g. "dig_down"
+INSTINCT_FAIL_THRESHOLD = 5        # failures before LLM escalation
 
 # ============================================
 # LLM (only used in Layer 2)
@@ -89,13 +92,14 @@ from langchain.tools import tool as lc_tool
 @lc_tool
 def set_grand_goal(goal_name: str) -> str:
     """Set a grand goal from saved goals. Use list_saved_goals() to see available goals.
-    If no matching goal exists, use create_custom_grand_goal() instead."""
+    If no matching goal exists, use create_custom_grand_goal() instead.
+    IMPORTANT: After setting a goal, STOP. The system auto-starts task chains each tick."""
     global _pending_goal_request
     is_user = _pending_goal_request is not None
     result = goal_manager.set_grand_goal(goal_name, user_requested=is_user)
     if is_user:
         _pending_goal_request = None
-    return result
+    return result + "\n✅ Goal set. Tasks will auto-execute each tick. STOP NOW."
 
 @lc_tool
 def complete_grand_task(task_id: str) -> str:
@@ -115,11 +119,26 @@ def get_grand_goal_status() -> str:
 @lc_tool
 def choose_next_chain(chain_name: str) -> str:
     """Start an action chain. The chain will execute automatically without LLM.
-    Available chains: get_wood, mine_stone, make_crafting_table, make_wooden_pickaxe,
+    IMPORTANT: After calling this, STOP IMMEDIATELY. Do NOT call this again.
+    The system auto-executes chains — you do NOT need to start multiple chains.
+
+    Default chains: get_wood, mine_stone, make_crafting_table, make_wooden_pickaxe,
     make_stone_pickaxe, make_iron_pickaxe, make_iron_sword, make_iron_armor,
     make_shield, make_bucket, mine_diamonds, make_diamond_pickaxe,
-    make_diamond_sword, find_food, build_shelter, place_furnace, place_chest"""
+    make_diamond_sword, find_food, build_shelter, place_furnace, place_chest
+
+    You can also use custom chains created with create_custom_chain().
+    Call list_custom_chains() to see available custom chains."""
+    if not chain_name or not chain_name.strip():
+        all_chains = list_available_chains()
+        return f"Invalid: empty chain name. Available chains: {', '.join(all_chains)}"
+    # Prevent LLM from overriding an already-running chain
+    if chain_executor.active_chain:
+        return (f"Chain '{chain_executor.active_chain.chain_name}' is ALREADY RUNNING. "
+                f"STOP — do not call choose_next_chain again. The chain runs automatically.")
     result = chain_executor.start_chain(chain_name)
+    if "Started" in result or "▶️" in result:
+        return result + "\n✅ Chain started. It runs automatically. STOP NOW — do not call any more tools."
     return result
 
 @lc_tool
@@ -155,11 +174,12 @@ def find_similar_goals(description: str) -> str:
 def create_custom_grand_goal(name: str, description: str, phases_json: str, tasks_json: str) -> str:
     """Create a brand new grand goal with custom tasks and save it to the library.
 
-    IMPORTANT: tasks must use ONLY these chain_name values (or "" for LLM-handled tasks):
-      get_wood, mine_stone, make_crafting_table, make_wooden_pickaxe,
+    IMPORTANT: tasks must use valid chain_name values (or "" for LLM-handled tasks).
+    Default chains: get_wood, mine_stone, make_crafting_table, make_wooden_pickaxe,
       make_stone_pickaxe, make_iron_pickaxe, make_iron_sword, make_iron_armor,
       make_shield, make_bucket, mine_diamonds, make_diamond_pickaxe,
       make_diamond_sword, find_food, build_shelter, place_furnace, place_chest
+    You can also use custom chains — call list_custom_chains() to see them.
 
     Args:
         name: Unique goal name (snake_case, e.g., 'diamond_armor_set')
@@ -187,7 +207,7 @@ def create_custom_grand_goal(name: str, description: str, phases_json: str, task
 
     if is_user:
         _pending_goal_request = None
-    return result
+    return result + "\n✅ Goal created and saved. Tasks will auto-execute each tick. STOP NOW — do NOT call choose_next_chain."
 
 @lc_tool
 def request_custom_goal(description: str) -> str:
@@ -201,11 +221,72 @@ def request_custom_goal(description: str) -> str:
     _pending_goal_request = description
     return f"Goal request queued: '{description}'. Planning will start next tick."
 
+@lc_tool
+def create_custom_chain(chain_name: str, description: str, steps_json: str) -> str:
+    """Create a new custom action chain and save it for future use.
+    Custom chains persist across restarts. Use choose_next_chain() to start them.
+
+    CRITICAL PATTERN — chains MUST follow: gather → craft → equip
+      1. GATHER: mine_block with type="search", search_target, skip_if
+      2. CRAFT: craft_item with skip_if
+      3. EQUIP/PLACE: equip_item or place_block (if needed)
+
+    EXAMPLE (make_stone_sword):
+      [
+        {"tool": "mine_block", "args": {"block_type": "stone", "count": 2},
+         "type": "search", "search_target": "stone", "skip_if": {"cobblestone": 2}},
+        {"tool": "craft_item", "args": {"item_name": "stick"},
+         "type": "craft", "skip_if": {"stick": 2}},
+        {"tool": "craft_item", "args": {"item_name": "stone_sword"},
+         "type": "craft", "skip_if": {"stone_sword": 1}},
+        {"tool": "equip_item", "args": {"item_name": "stone_sword"}, "type": "action"}
+      ]
+
+    VALIDATION RULES (will be rejected if violated):
+      - craft_item steps REQUIRE preceding mine_block/find_block gather steps
+      - Every craft_item and search step MUST have skip_if
+      - search steps MUST have search_target
+
+    Valid tools: mine_block, craft_item, smelt_item, place_block, equip_item, eat_food,
+      attack_entity, dig_down, dig_tunnel, branch_mine, build_shelter, explore,
+      move_to, find_block, flee, escape_water, shield_block, store_items,
+      retrieve_items, open_chest, use_bucket, collect_drops, scan_caves
+
+    Args:
+        chain_name: Unique name (snake_case). Must NOT conflict with existing default chains.
+        description: What this chain does (e.g., "Mine gold ore and smelt into gold ingots")
+        steps_json: JSON array of step dicts
+    """
+    try:
+        steps = json.loads(steps_json)
+    except json.JSONDecodeError as e:
+        return f"Invalid JSON: {e}"
+    from chain_library import _get_custom_lib
+    custom_lib = _get_custom_lib()
+    return custom_lib.save_chain(chain_name, description, steps)
+
+@lc_tool
+def list_custom_chains() -> str:
+    """List all custom chains that have been created by the LLM.
+    Shows chain name, description, step count, and success/fail stats.
+    Use this to check what custom chains exist before creating new ones."""
+    from chain_library import _get_custom_lib
+    custom_lib = _get_custom_lib()
+    chains = custom_lib.list_chains()
+    if not chains:
+        return "No custom chains created yet. Use create_custom_chain() to create one."
+    lines = ["Custom chains:"]
+    for c in chains:
+        stats = f" (success: {c['success_count']}, fail: {c['fail_count']})" if c['success_count'] + c['fail_count'] > 0 else ""
+        lines.append(f"  - {c['name']}: {c['description']} [{c['step_count']} steps]{stats}")
+    return "\n".join(lines)
+
 LLM_TOOLS = (
     ALL_TOOLS + DEATH_TOOLS + MEMORY_TOOLS +
     [set_grand_goal, complete_grand_task, skip_grand_task,
      get_grand_goal_status, choose_next_chain,
-     list_saved_goals, find_similar_goals, create_custom_grand_goal]
+     list_saved_goals, find_similar_goals, create_custom_grand_goal,
+     create_custom_chain, list_custom_chains]
 )
 
 # ============================================
@@ -239,12 +320,32 @@ WHEN CREATING A NEW GOAL:
 5. Tasks with "requires" must reference other task IDs in the same goal
 6. Set completion_items for auto-completion (inventory check) when possible
 
-IMPORTANT RULES:
-- ALWAYS call choose_next_chain() with one of the available chains
+CRITICAL RULES:
+- Call choose_next_chain() ONCE, then STOP. Never call it multiple times.
+- After set_grand_goal() or create_custom_grand_goal(), STOP IMMEDIATELY.
+  The system auto-starts chains from the goal's tasks each tick. You do NOT need to also call choose_next_chain.
 - Match the chain to the current grand goal's next available task
 - The chain name should match the task's chain_name in the goal progress
 - If a chain failed, ANALYZE why it failed and try a DIFFERENT approach
 - Keep responses SHORT — you're a planner, not a narrator
+- NEVER pass empty string "" to choose_next_chain — that is invalid
+
+WHEN A CHAIN FAILS (most important):
+- Read the error message carefully. "missing materials" means the bot lacks ingredients.
+- ALWAYS check the prerequisite dependency tree before picking the next chain:
+  Diamond gear → needs diamonds → needs iron_pickaxe → needs iron_ingot → needs stone_pickaxe → needs cobblestone → needs wooden_pickaxe → needs wood
+- If "missing materials for diamond_*" → run mine_diamonds first (needs iron_pickaxe!)
+- If "missing materials for iron_*" → run make_stone_pickaxe + mine iron first
+- If "No crafting table" → run make_crafting_table first
+- NEVER restart the same chain that just failed. Fix the prerequisite FIRST, then retry.
+- Look at the inventory in the error context to figure out what's actually missing.
+
+AUTO-EXECUTION FLOW (you don't control this — the system does it automatically):
+  1. Goal has tasks with chain_name fields
+  2. Each tick, the system picks the next available task
+  3. The system auto-starts the task's chain — NO LLM needed
+  4. When a chain completes, the system picks the next task
+  So after creating/setting a goal, just STOP. The system handles execution.
 
 AVAILABLE CHAINS (for choose_next_chain AND task chain_name):
   Gathering: get_wood, mine_stone
@@ -253,6 +354,36 @@ AVAILABLE CHAINS (for choose_next_chain AND task chain_name):
   Diamond: mine_diamonds, make_diamond_pickaxe, make_diamond_sword
   Building: build_shelter, place_furnace, place_chest
   Survival: find_food
+  NOTE: 'explore', 'craft_item', 'mine_block' etc. are NOT valid chain names.
+
+CUSTOM CHAINS:
+  If the task needs a chain that doesn't exist above, you can CREATE one:
+  1. Call list_custom_chains() to see existing custom chains first
+  2. Call create_custom_chain(name, description, steps_json) to create a new chain
+  3. Once created, use choose_next_chain(name) to start it
+  4. Custom chains persist across restarts and track success/fail stats
+
+CHAIN CREATION RULES (CRITICAL — chains that violate these WILL BE REJECTED):
+  Every chain MUST follow this pattern:
+    1. GATHER raw materials: mine_block with type="search", search_target, and skip_if
+    2. CRAFT intermediate items: craft_item with skip_if
+    3. CRAFT final item: craft_item with skip_if
+    4. EQUIP/PLACE if needed: equip_item or place_block
+
+  MANDATORY fields:
+    - Every mine_block/search step MUST have: type="search", search_target="block_name", skip_if
+    - Every craft_item step MUST have: skip_if
+    - skip_if prevents re-doing steps when items already exist
+
+  EXAMPLE — "make_wooden_sword" (correct):
+  Step 1: mine_block, block_type=oak_log, count=2, type=search, search_target=oak_log, skip_if oak_planks>=3
+  Step 2: craft_item, item_name=oak_planks, type=craft, skip_if oak_planks>=3
+  Step 3: craft_item, item_name=stick, type=craft, skip_if stick>=2
+  Step 4: craft_item, item_name=wooden_sword, type=craft, skip_if wooden_sword>=1
+  Step 5: equip_item, item_name=wooden_sword, type=action
+
+  WRONG — just craft_item without gather steps will ALWAYS FAIL.
+  No raw materials gathered, no skip_if — this chain cannot work!
 
 CRAFTING ORDER: wood → crafting_table → wooden_pickaxe → stone_pickaxe → iron_pickaxe → diamond_pickaxe
 Each requires the previous. Don't skip steps."""
@@ -635,6 +766,40 @@ def check_death() -> bool:
 
 
 # ============================================
+# INSTINCT FAILURE → AUTO-FIX MAPPING
+# ============================================
+
+def _get_instinct_fix_chain(instinct_key: str, error_lower: str, inventory: dict) -> Optional[str]:
+    """Map a failing instinct to the prerequisite chain that fixes it.
+    Returns chain name or None if LLM should decide."""
+    has_pickaxe = any(k.endswith("_pickaxe") for k in inventory if inventory[k] > 0)
+    has_planks = inventory.get("oak_planks", 0) >= 4 or inventory.get("birch_planks", 0) >= 4
+    has_sticks = inventory.get("stick", 0) >= 2
+    has_wood = any(k.endswith("_log") for k in inventory if inventory[k] > 0)
+
+    if instinct_key == "dig_down":
+        # dig_down now works by hand (slow but functional)
+        # If it still fails, likely a different issue (bedrock, timeout, etc.)
+        return None  # LLM should decide
+
+    if instinct_key == "eat_food":
+        return "find_food"
+
+    if instinct_key == "escape_water":
+        return "get_wood"  # need blocks to place
+
+    if instinct_key in ("attack_entity", "flee"):
+        has_sword = any(k.endswith("_sword") for k in inventory if inventory[k] > 0)
+        if not has_sword:
+            if has_pickaxe:
+                return "make_stone_pickaxe"  # progress toward sword materials
+            return "get_wood"
+        return None  # Has weapon but failing → LLM should decide
+
+    return None  # Unknown instinct → LLM decides
+
+
+# ============================================
 # MAIN TICK LOGIC
 # ============================================
 
@@ -654,18 +819,77 @@ def tick_once(tick_num: int):
     for msg in progress_msgs:
         print(f"   {msg}")
 
-    # If current task was auto-completed, clear chain
+    # If current task was auto-completed, handle chain cleanup
     current_task = goal_manager.get_current_task()
     if chain_executor.has_active_chain() and not current_task:
         # Task got auto-completed while chain was running
-        chain_executor.cancel_chain("task auto-completed")
+        # Check if remaining steps are just equip — let them finish naturally
+        chain = chain_executor.active_chain
+        remaining = chain.steps[chain.current_idx:] if chain else []
+        only_equip = remaining and all(s.get("tool") == "equip_item" for s in remaining)
+        if only_equip:
+            pass  # Let equip steps run on next tick
+        else:
+            chain_executor.cancel_chain("task auto-completed")
+            # Ensure gear is equipped since chain's equip step was skipped
+            inv = get_inventory_counts()
+            chain_executor._auto_equip_best_gear(inv)
 
     # ── Layer 0: Instinct ──
+    global _instinct_fail_streak, _last_failed_instinct_key
     instinct_result = check_instinct(state, threat)
     if instinct_result:
         print(f"   ⚡ L0 INSTINCT: {instinct_result.action}")
         print(f"      → {instinct_result.result[:100]}")
         death_analyzer.record_action(f"instinct:{instinct_result.action}")
+
+        # Track consecutive instinct failures → escalate after threshold
+        if not instinct_result.success:
+            instinct_key = instinct_result.action.split("(")[0]
+            if instinct_key == _last_failed_instinct_key:
+                _instinct_fail_streak += 1
+            else:
+                _instinct_fail_streak = 1
+                _last_failed_instinct_key = instinct_key
+
+            if _instinct_fail_streak >= INSTINCT_FAIL_THRESHOLD:
+                fail_count = _instinct_fail_streak
+                _instinct_fail_streak = 0
+                _last_failed_instinct_key = ""
+                inv = get_inventory_counts()
+                error_lower = instinct_result.result.lower()
+
+                # Map instinct failure → specific prerequisite chain
+                recommended_chain = _get_instinct_fix_chain(instinct_key, error_lower, inv)
+
+                print(f"   🔄 Instinct '{instinct_key}' failed {fail_count}x → LLM escalation")
+
+                if recommended_chain:
+                    # Auto-start the fix chain directly (no LLM needed)
+                    print(f"   🔧 Auto-fix: starting '{recommended_chain}' to resolve instinct failure")
+                    chain_steps = get_chain(recommended_chain)
+                    if chain_steps:
+                        chain_executor.start_chain(recommended_chain)
+                        return
+
+                # Fallback: LLM escalation if no auto-fix available
+                call_llm_planner("Instinct stuck in failure loop — fix the cause",
+                    f"URGENT: L0 instinct '{instinct_result.action}' has failed {fail_count} times.\n"
+                    f"Error: {instinct_result.result}\n"
+                    f"Inventory: {json.dumps(dict(list(inv.items())[:20]))}\n\n"
+                    f"INSTINCT GOALS:\n"
+                    f"  dig_down (night evasion) → bot needs to get underground.\n"
+                    f"    Fix: get_wood → make_crafting_table → make_wooden_pickaxe\n"
+                    f"  eat_food (hunger) → bot needs food. Fix: find_food\n"
+                    f"  escape_water (drowning) → bot needs to reach land. Fix: explore\n"
+                    f"  attack_entity/flee (combat) → bot needs weapon/armor. Fix: make_iron_sword\n\n"
+                    f"Choose the FIRST prerequisite chain that solves this instinct failure. "
+                    f"Do NOT choose chains unrelated to this instinct.")
+                return
+        else:
+            # Success — clear failure tracking
+            _instinct_fail_streak = 0
+            _last_failed_instinct_key = ""
 
         # Record combat encounters to experience memory
         action_str = instinct_result.action
@@ -708,21 +932,19 @@ def tick_once(tick_num: int):
         pending_desc = _pending_goal_request
         goals = goal_manager.goal_library.list_goals()
         goal_list = "\n".join(f"  - {g['name']}: {g['description']} ({g['task_count']} tasks)" for g in goals)
+        chain_list = list_available_chains()
         call_llm_planner(
             "Player requested a custom goal",
             f'A player asked: "{pending_desc}"\n'
             f'This is a USER REQUEST — it has priority over auto-selected goals.\n\n'
             f'STEPS:\n'
             f'1. Call find_similar_goals("{pending_desc}") to check saved goals\n'
-            f'2. If a similar goal exists → call set_grand_goal(name)\n'
-            f'3. If not → call create_custom_grand_goal() with proper tasks\n\n'
+            f'2. ONLY if the found goal EXACTLY matches what the player wants → call set_grand_goal(name)\n'
+            f'   For example: "diamond armor" does NOT match "iron gear" — those are DIFFERENT materials!\n'
+            f'3. If no exact match → call create_custom_grand_goal() with proper tasks\n\n'
             f'Saved goals:\n{goal_list}\n\n'
-            f'AVAILABLE CHAINS for chain_name:\n'
-            f'  get_wood, mine_stone, make_crafting_table, make_wooden_pickaxe,\n'
-            f'  make_stone_pickaxe, make_iron_pickaxe, make_iron_sword,\n'
-            f'  make_iron_armor, make_shield, make_bucket, mine_diamonds,\n'
-            f'  make_diamond_pickaxe, make_diamond_sword, find_food,\n'
-            f'  build_shelter, place_furnace, place_chest\n'
+            f'AVAILABLE CHAINS for chain_name:\n  {", ".join(chain_list)}\n'
+            f'  Plus any custom chains (call list_custom_chains() to see them).\n'
             f'  (or "" for tasks the LLM handles at execution time)'
         )
         # Safety: clear if tool didn't consume it

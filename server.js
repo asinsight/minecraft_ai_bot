@@ -47,6 +47,52 @@ let combatState = {
   combatStartTime: 0,        // when combat began (0 = not in combat)
 }
 
+// ── Drop Collection Tracking ──
+let pendingDrops = []
+
+// ── Lava Scan Helper ──
+function scanForLava(pos, radius = 3) {
+  if (!botReady) return []
+  const lavaBlocks = bot.findBlocks({
+    matching: b => b.name === 'lava' || b.name === 'flowing_lava',
+    maxDistance: radius,
+    count: 20,
+    point: pos
+  })
+  return lavaBlocks.map(p => ({
+    position: { x: p.x, y: p.y, z: p.z },
+    distance: pos.distanceTo(p)
+  }))
+}
+
+// ── Lava Safety: try to use water bucket to neutralize lava ──
+async function tryWaterBucketOnLava(lavaPos) {
+  const waterBucket = bot.inventory.items().find(i => i.name === 'water_bucket')
+  if (!waterBucket) return false
+  try {
+    await bot.equip(waterBucket, 'hand')
+    const lavaBlock = bot.blockAt(lavaPos)
+    if (lavaBlock) {
+      await bot.activateBlock(lavaBlock)
+      await new Promise(r => setTimeout(r, 500))
+      // Pick water back up (it should be a water source now turned to obsidian)
+      const bucket = bot.inventory.items().find(i => i.name === 'bucket')
+      if (bucket) {
+        await bot.equip(bucket, 'hand')
+        const waterBlock = bot.blockAt(lavaPos)
+        if (waterBlock && (waterBlock.name === 'water' || waterBlock.name === 'flowing_water')) {
+          await bot.activateBlock(waterBlock)
+        }
+      }
+      console.log(`[lava-safety] Neutralized lava at ${lavaPos.x}, ${lavaPos.y}, ${lavaPos.z}`)
+      return true
+    }
+  } catch (e) {
+    console.log(`[lava-safety] Failed to neutralize lava: ${e.message}`)
+  }
+  return false
+}
+
 // ============================================
 // EXPRESS API SERVER
 // ============================================
@@ -59,6 +105,16 @@ app.post('/abort', (req, res) => {
   abortFlag = true
   try { bot.pathfinder.setGoal(null) } catch (e) {}
   res.json({ success: true, message: 'Abort flag set' })
+})
+
+// Clear stale abort flag on new action requests (prevents race condition
+// where a previous timeout's abort flag blocks the next request)
+app.use('/action', (req, res, next) => {
+  if (abortFlag) {
+    console.log('[abort] Clearing stale abort flag before new action')
+    abortFlag = false
+  }
+  next()
 })
 
 // ── STATE ENDPOINTS ──
@@ -135,8 +191,14 @@ app.get('/state', (req, res) => {
 
   const inventory = bot.inventory.items().map(item => ({
     name: item.name,
-    count: item.count
+    count: item.count,
+    durability: item.maxDurability ? {
+      current: item.maxDurability - (item.nbt?.value?.Damage?.value || 0),
+      max: item.maxDurability,
+      percent: Math.round(((item.maxDurability - (item.nbt?.value?.Damage?.value || 0)) / item.maxDurability) * 100)
+    } : null
   }))
+  const emptySlots = 36 - inventory.length
 
   // Time phases: 0-1000 sunrise, 1000-6000 morning, 6000-12000 afternoon,
   // 12000-13000 dusk, 13000-18000 night, 18000-23000 midnight, 23000-24000 dawn
@@ -213,6 +275,7 @@ app.get('/state', (req, res) => {
       timeSinceHit: combatState.lastHitTime ? Math.floor((Date.now() - combatState.lastHitTime) / 1000) : null,
     },
     inventory,
+    emptySlots,
     nearbyBlocks: blockNames,
     nearbyEntities,
     recentChat: lastChatMessages.slice(-10)
@@ -253,6 +316,41 @@ app.get('/inventory', (req, res) => {
     slot: item.slot
   }))
   res.json({ items })
+})
+
+// GET /surrounding_blocks - Check blocks immediately around bot (for stuck detection)
+app.get('/surrounding_blocks', (req, res) => {
+  if (!botReady) return res.status(503).json({ error: 'Bot not ready' })
+  const pos = bot.entity.position.floored()
+  // Check 4 horizontal directions at feet and head level
+  const directions = [
+    { name: 'north', dx: 0, dz: -1 },
+    { name: 'south', dx: 0, dz: 1 },
+    { name: 'east', dx: 1, dz: 0 },
+    { name: 'west', dx: -1, dz: 0 }
+  ]
+  const passable = (block) => !block || block.name === 'air' || block.boundingBox !== 'block'
+  const result = {}
+  for (const dir of directions) {
+    const feet = bot.blockAt(pos.offset(dir.dx, 0, dir.dz))
+    const head = bot.blockAt(pos.offset(dir.dx, 1, dir.dz))
+    const feetPassable = passable(feet)
+    const headPassable = passable(head)
+    result[dir.name] = {
+      feet: { name: feet?.name || 'air', passable: feetPassable },
+      head: { name: head?.name || 'air', passable: headPassable },
+      open: feetPassable && headPassable,
+      x: pos.x + dir.dx,
+      z: pos.z + dir.dz
+    }
+  }
+  // Also check above and below
+  const above = bot.blockAt(pos.offset(0, 2, 0))
+  const below = bot.blockAt(pos.offset(0, -1, 0))
+  result.above = { name: above?.name || 'air', passable: passable(above) }
+  result.below = { name: below?.name || 'air', passable: passable(below) }
+  result.position = { x: pos.x, y: pos.y, z: pos.z }
+  res.json(result)
 })
 
 // GET /nearby
@@ -454,8 +552,9 @@ app.get('/find_block', (req, res) => {
   const blockType = req.query.type
   const maxDist = parseInt(req.query.range) || 64
 
+  // Exact match + deepslate variant for ores (e.g., iron_ore → also matches deepslate_iron_ore)
   const block = bot.findBlock({
-    matching: b => b.name.includes(blockType),
+    matching: b => b.name === blockType || b.name === 'deepslate_' + blockType,
     maxDistance: maxDist
   })
 
@@ -670,9 +769,19 @@ app.post('/action/mine', async (req, res) => {
     let mined = 0
 
     // Auto-equip best tool for the job
-    const equippedTool = await autoEquipBestTool(block_type)
+    let equippedTool = await autoEquipBestTool(block_type)
 
-    // Blocks that REQUIRE a tool (can't mine with fist or drop nothing)
+    // Fallback: if autoEquipBestTool found nothing, check if bot is already holding a valid tool
+    // (Python-side _auto_equip_for_mining may have equipped it via /action/equip before this call)
+    if (!equippedTool && bot.heldItem) {
+      const held = bot.heldItem.name
+      if (held.includes('pickaxe') || held.includes('axe') || held.includes('shovel')) {
+        console.log(`[auto-equip] Fallback: bot already holding ${held}`)
+        equippedTool = held
+      }
+    }
+
+    // ── Tool requirement checks ──
     const requiresPickaxe = ['iron_ore', 'coal_ore', 'gold_ore', 'diamond_ore', 'copper_ore',
       'redstone_ore', 'lapis_ore', 'emerald_ore', 'nether_quartz_ore', 'nether_gold_ore',
       'obsidian', 'deepslate_iron_ore', 'deepslate_coal_ore', 'deepslate_gold_ore',
@@ -684,93 +793,310 @@ app.post('/action/mine', async (req, res) => {
     if (needsTool && !equippedTool) {
       return res.json({
         success: false,
-        message: `Cannot mine ${block_type} without a tool! Craft a pickaxe first: wood → planks → sticks → crafting_table → wooden_pickaxe. Then upgrade: cobblestone → stone_pickaxe → iron_ore needs stone_pickaxe or better.`
+        message: `Cannot mine ${block_type} without a tool! Craft a pickaxe first.`
       })
     }
-
-    // Iron ore specifically needs stone pickaxe or better
     const needsStonePlus = requiresPickaxe.some(kw => block_type.includes(kw))
     if (needsStonePlus && equippedTool && equippedTool.startsWith('wooden_')) {
-      return res.json({
-        success: false,
-        message: `${block_type} needs stone_pickaxe or better! A wooden_pickaxe won't drop anything. Craft stone_pickaxe first (3 cobblestone + 2 sticks at crafting table).`
-      })
+      return res.json({ success: false, message: `${block_type} needs stone_pickaxe or better!` })
     }
-
-    // Diamond ore needs iron pickaxe or better
     const needsIronPlus = ['diamond_ore', 'deepslate_diamond_ore', 'gold_ore', 'deepslate_gold_ore',
       'emerald_ore', 'deepslate_emerald_ore', 'redstone_ore', 'deepslate_redstone_ore']
-    const needsIron = needsIronPlus.some(kw => block_type.includes(kw))
-    if (needsIron && equippedTool && (equippedTool.startsWith('wooden_') || equippedTool.startsWith('stone_'))) {
-      return res.json({
-        success: false,
-        message: `${block_type} needs iron_pickaxe or better! Your ${equippedTool} won't drop anything. Smelt iron ore → iron ingot → craft iron_pickaxe first.`
-      })
+    if (needsIronPlus.some(kw => block_type.includes(kw)) && equippedTool &&
+        (equippedTool.startsWith('wooden_') || equippedTool.startsWith('stone_'))) {
+      return res.json({ success: false, message: `${block_type} needs iron_pickaxe or better!` })
     }
 
-    // Warn if mining wood without an axe (works but very slow)
-    const isWood = ['log', 'wood', 'planks'].some(kw => block_type.includes(kw))
-    if (isWood && !equippedTool) {
-      // Allow it but warn — first few logs are always by hand
-      console.log(`[auto-equip] Mining ${block_type} by hand (slow). Craft an axe to speed up.`)
+    const isWood = ['log', 'wood'].some(kw => block_type.includes(kw))
+
+    // ── Helper: force-equip the mining tool and verify it's held ──
+    const ensureToolHeld = async () => {
+      if (!equippedTool) return
+      const held = bot.heldItem?.name
+      if (held === equippedTool) return  // already correct
+      // Try to equip
+      const toolItem = bot.inventory.items().find(i => i.name === equippedTool)
+      if (!toolItem) {
+        // Tool broke or lost — find next best
+        equippedTool = await autoEquipBestTool(block_type)
+        await new Promise(r => setTimeout(r, 150))
+        return
+      }
+      try {
+        await bot.equip(toolItem, 'hand')
+        await new Promise(r => setTimeout(r, 150))  // wait for server to process
+        console.log(`[mine] Re-equipped ${equippedTool} (was holding: ${held || 'nothing'})`)
+      } catch (e) {
+        console.log(`[mine] Re-equip failed: ${e.message}, retrying...`)
+        // Second attempt
+        try {
+          const freshItem = bot.inventory.items().find(i => i.name === equippedTool)
+          if (freshItem) {
+            await bot.equip(freshItem, 'hand')
+            await new Promise(r => setTimeout(r, 150))
+          }
+        } catch (e2) { /* give up */ }
+      }
     }
 
+    // ── Use non-scaffolding movements for mine pathfinding ──
+    // Prevents pathfinder from equipping blocks (which changes held tool)
+    const mcData = require('minecraft-data')(bot.version)
+    const mineMovements = new Movements(bot, mcData)
+    mineMovements.allowSprinting = true
+    mineMovements.scafoldingBlocks = []  // CRITICAL: don't scaffold during mining
+    bot.pathfinder.setMovements(mineMovements)
+
+    // ── Helper: clear obstructing blocks between bot and target ──
+    const clearPathTo = async (targetPos) => {
+      const botPos = bot.entity.position.floored()
+      const dx = Math.sign(targetPos.x - botPos.x)
+      const dz = Math.sign(targetPos.z - botPos.z)
+
+      // Clear blocks in the direction of the target (feet + head level, 3 blocks ahead)
+      for (let step = 1; step <= 3; step++) {
+        if (abortFlag) break
+        for (let dy = 0; dy <= 1; dy++) {
+          const checkPos = botPos.offset(dx * step, dy, dz * step)
+          const b = bot.blockAt(checkPos)
+          if (b && b.boundingBox === 'block' && b.name !== 'air' && b.name !== 'cave_air'
+              && !b.name.includes(block_type)) {
+            try { await bot.dig(b) } catch (e) { /* ignore */ }
+          }
+        }
+      }
+    }
+
+    // ── Helper: collect dropped items near a position ──
+    const collectItemsNear = async (pos, radius = 8) => {
+      const nearbyItems = Object.values(bot.entities).filter(
+        e => e.name === 'item' && e.position.distanceTo(pos) < radius
+      )
+      for (const item of nearbyItems) {
+        if (abortFlag) break
+        // Clear any lingering pathfinder goal before each item attempt
+        try { bot.pathfinder.setGoal(null) } catch (e) {}
+        const t = setTimeout(() => { try { bot.pathfinder.setGoal(null) } catch(e) {} }, 3000)
+        try {
+          await bot.pathfinder.goto(new goals.GoalNear(item.position.x, item.position.y, item.position.z, 1))
+          await new Promise(r => setTimeout(r, 250))
+        } catch (e) {
+          /* item may have been collected already or path blocked */
+        } finally {
+          clearTimeout(t)
+        }
+      }
+    }
+
+    // ── Main mining loop ──
+    const failedPositions = new Set()  // Track unreachable block positions
+    const MAX_FAILS = 10  // Safety limit for unreachable blocks
     for (let i = 0; i < mineCount; i++) {
+      if (failedPositions.size >= MAX_FAILS) break
       if (abortFlag) {
         abortFlag = false
-        return res.json({ success: false, message: `Aborted after ${mined} ${block_type} (abort requested)` })
+        return res.json({ success: false, message: `Aborted after ${mined} ${block_type}` })
       }
 
-      const block = bot.findBlock({
-        matching: b => b.name.includes(block_type),
-        maxDistance: 64
-      })
+      // 1. Find the target block using block IDs (more reliable than callback matching)
+      const blockType1 = mcData.blocksByName[block_type]
+      const blockType2 = mcData.blocksByName['deepslate_' + block_type]
+      const matchIds = []
+      if (blockType1) matchIds.push(blockType1.id)
+      if (blockType2) matchIds.push(blockType2.id)
 
+      let block = null
+      if (matchIds.length > 0) {
+        // findBlocks returns Vec3 positions — filter by failedPositions, then get Block
+        const foundPositions = bot.findBlocks({
+          matching: matchIds,
+          maxDistance: 64,
+          count: 20
+        })
+        for (const pos of foundPositions) {
+          const key = `${pos.x},${pos.y},${pos.z}`
+          if (!failedPositions.has(key)) {
+            block = bot.blockAt(pos)
+            if (block && block.name !== 'air') break
+            block = null
+          }
+        }
+      }
       if (!block) {
-        if (mined === 0) return res.json({ success: false, message: `No ${block_type} found nearby` })
+        if (mined === 0) {
+          if (failedPositions.size > 0) {
+            return res.json({ success: false, message: `Found ${failedPositions.size} ${block_type} but all unreachable (enclosed in stone). Try mining toward them.` })
+          }
+          return res.json({ success: false, message: `No ${block_type} found nearby` })
+        }
         break
       }
 
-      // Move to block with timeout
-      const moveTimeout = setTimeout(() => { bot.pathfinder.setGoal(null) }, 15000)
+      const targetPos = block.position
+      const dist = bot.entity.position.distanceTo(targetPos)
+      console.log(`[mine] Found ${block.name} at ${targetPos} (dist=${dist.toFixed(1)})`)
+
+      // 2. For trees: clear leaves around target so bot can approach and items can drop
+      if (isWood) {
+        for (let dx = -2; dx <= 2; dx++) {
+          for (let dy = -1; dy <= 2; dy++) {
+            for (let dz = -2; dz <= 2; dz++) {
+              if (abortFlag) break
+              const b = bot.blockAt(targetPos.offset(dx, dy, dz))
+              if (b && b.name.includes('leaves')) {
+                try { await bot.dig(b) } catch (e) { /* ignore */ }
+              }
+            }
+          }
+        }
+      }
+
+      // 3. Move to within reach of the block
+      let reachedTarget = false
+      const REACH = 4.5
+
+      // Attempt 1: normal pathfinding
       try {
-        await bot.pathfinder.goto(new goals.GoalNear(block.position.x, block.position.y, block.position.z, 1))
-      } catch (e) {
-        // Try to proceed even if pathfinding is imperfect
-      }
-      clearTimeout(moveTimeout)
+        const t = setTimeout(() => { bot.pathfinder.setGoal(null) }, 15000)
+        await bot.pathfinder.goto(new goals.GoalNear(targetPos.x, targetPos.y, targetPos.z, 2))
+        clearTimeout(t)
+      } catch (e) { /* pathfinding may fail partially */ }
 
-      // Re-equip if tool broke
-      if (equippedTool && !bot.inventory.items().find(i => i.name === equippedTool)) {
-        await autoEquipBestTool(block_type)
+      if (bot.entity.position.distanceTo(targetPos) <= REACH) {
+        reachedTarget = true
       }
 
-      // Dig
-      const targetBlock = bot.blockAt(block.position)
-      if (targetBlock) {
-        await bot.dig(targetBlock)
-        mined++
-      }
-
-      // Wait a moment for item drops
-      await new Promise(resolve => setTimeout(resolve, 300))
-
-      // Collect nearby items
-      const items = Object.values(bot.entities).filter(
-        e => e.name === 'item' && e.position.distanceTo(bot.entity.position) < 5
-      )
-      for (const item of items) {
+      // Attempt 2: if still too far, clear obstacles and walk closer
+      if (!reachedTarget) {
+        console.log(`[mine] Pathfind incomplete (dist=${bot.entity.position.distanceTo(targetPos).toFixed(1)}), clearing path...`)
+        await clearPathTo(targetPos)
         try {
-          const collectTimeout = setTimeout(() => { bot.pathfinder.setGoal(null) }, 5000)
-          await bot.pathfinder.goto(new goals.GoalNear(item.position.x, item.position.y, item.position.z, 0))
-          clearTimeout(collectTimeout)
-        } catch (e) { /* item may have been collected already */ }
+          const t = setTimeout(() => { bot.pathfinder.setGoal(null) }, 10000)
+          await bot.pathfinder.goto(new goals.GoalNear(targetPos.x, targetPos.y, targetPos.z, 2))
+          clearTimeout(t)
+        } catch (e) { /* best effort */ }
+        reachedTarget = bot.entity.position.distanceTo(targetPos) <= REACH
+      }
+
+      if (!reachedTarget) {
+        console.log(`[mine] Cannot reach ${block.name} at ${targetPos} (dist=${bot.entity.position.distanceTo(targetPos).toFixed(1)}), blacklisting`)
+        failedPositions.add(`${targetPos.x},${targetPos.y},${targetPos.z}`)
+        i--  // Don't count failed attempts against mineCount
+        continue
+      }
+
+      // 4. Force re-equip tool right before dig (handles pathfinder scaffold, tool break, etc.)
+      await ensureToolHeld()
+
+      // 4b. If tool broke mid-loop and block requires one, stop mining
+      if (!equippedTool && needsTool) {
+        console.log(`[mine] Tool broke and no replacement available — stopping after ${mined} mined`)
+        break
+      }
+
+      // 5. Dig the block
+      const targetBlock = bot.blockAt(targetPos)
+      if (targetBlock && targetBlock.name !== 'air' && targetBlock.name !== 'cave_air'
+          && targetBlock.boundingBox === 'block') {
+        console.log(`[mine] Digging ${targetBlock.name} with: ${bot.heldItem?.name || 'BARE HANDS'}`)
+        try {
+          await bot.dig(targetBlock)
+          mined++
+        } catch (digErr) {
+          console.log(`[mine] Dig failed at ${targetPos}: ${digErr.message}`)
+        }
+      } else {
+        console.log(`[mine] Block at ${targetPos} is ${targetBlock?.name || 'null'}, skipping`)
+      }
+
+      // 5b. Cluster mining: scan nearby blocks for more of the same ore
+      //     bot.blockAt() directly reads chunk data — more reliable than findBlock for adjacent blocks
+      if (!isWood && mined > 0) {
+        const CLUSTER_RADIUS = 4
+        const clusterQueue = []
+        for (let dx = -CLUSTER_RADIUS; dx <= CLUSTER_RADIUS; dx++) {
+          for (let dy = -CLUSTER_RADIUS; dy <= CLUSTER_RADIUS; dy++) {
+            for (let dz = -CLUSTER_RADIUS; dz <= CLUSTER_RADIUS; dz++) {
+              if (dx === 0 && dy === 0 && dz === 0) continue
+              const adjPos = targetPos.offset(dx, dy, dz)
+              const adjBlock = bot.blockAt(adjPos)
+              if (adjBlock && (adjBlock.name === block_type || adjBlock.name === 'deepslate_' + block_type)) {
+                const key = `${adjPos.x},${adjPos.y},${adjPos.z}`
+                if (!failedPositions.has(key)) {
+                  clusterQueue.push(adjPos.clone())
+                }
+              }
+            }
+          }
+        }
+        if (clusterQueue.length > 0) {
+          console.log(`[mine] Cluster detected! ${clusterQueue.length} more ${block_type} within ${CLUSTER_RADIUS} blocks`)
+        }
+        for (const clusterPos of clusterQueue) {
+          if (mined >= mineCount) break
+          if (abortFlag) break
+
+          // Re-equip tool before each cluster dig
+          await ensureToolHeld()
+          if (!equippedTool && needsTool) break
+
+          // Check if block is still there (might have been mined by earlier cluster iteration)
+          const cb = bot.blockAt(clusterPos)
+          if (!cb || cb.name === 'air' || cb.name === 'cave_air') continue
+
+          const clusterDist = bot.entity.position.distanceTo(clusterPos)
+          if (clusterDist > REACH) {
+            // Need to move closer
+            try {
+              const t = setTimeout(() => { bot.pathfinder.setGoal(null) }, 8000)
+              await bot.pathfinder.goto(new goals.GoalNear(clusterPos.x, clusterPos.y, clusterPos.z, 2))
+              clearTimeout(t)
+            } catch (e) { /* best effort */ }
+            if (bot.entity.position.distanceTo(clusterPos) > REACH) {
+              console.log(`[mine] Cannot reach cluster block at ${clusterPos}, skipping`)
+              continue
+            }
+          }
+
+          try {
+            console.log(`[mine] Cluster mining ${cb.name} at ${clusterPos}`)
+            await bot.dig(cb)
+            mined++
+          } catch (e) {
+            console.log(`[mine] Cluster dig failed: ${e.message}`)
+          }
+        }
+      }
+
+      // 6. Collect dropped items
+      await new Promise(r => setTimeout(r, 600))  // wait for drops to settle
+      await collectItemsNear(targetPos)
+      // Second pass for slow-falling items (trees)
+      if (isWood) {
+        await new Promise(r => setTimeout(r, 500))
+        await collectItemsNear(bot.entity.position, 6)
       }
     }
 
-    const toolMsg = equippedTool ? ` (using ${equippedTool})` : ' (no tool available — used fist!)'
-    res.json({ success: true, message: `Mined ${mined} ${block_type}${toolMsg}` })
+    // Restore default movements (with scaffolding) after mining
+    const defaultMovements = new Movements(bot, mcData)
+    defaultMovements.allowSprinting = true
+    bot.pathfinder.setMovements(defaultMovements)
+
+    const toolMsg = equippedTool ? ` (using ${equippedTool})` : ' (no tool — used fist!)'
+    if (mined === 0) {
+      res.json({ success: false, message: `Found ${block_type} but failed to mine any${toolMsg}` })
+    } else {
+      res.json({ success: true, message: `Mined ${mined} ${block_type}${toolMsg}` })
+    }
   } catch (err) {
+    // Restore default movements on error too
+    try {
+      const mcData2 = require('minecraft-data')(bot.version)
+      const defaultMovements = new Movements(bot, mcData2)
+      defaultMovements.allowSprinting = true
+      bot.pathfinder.setMovements(defaultMovements)
+    } catch (e) { /* ignore */ }
     res.json({ success: false, message: err.message })
   }
 })
@@ -1089,6 +1415,24 @@ app.post('/action/equip', async (req, res) => {
   if (!botReady) return res.status(503).json({ error: 'Bot not ready' })
   try {
     const { item_name, destination } = req.body
+
+    // Check if already equipped in the target slot
+    const slotMap = { 'head': 5, 'torso': 6, 'legs': 7, 'feet': 8, 'off-hand': 45 }
+    const targetSlot = slotMap[destination]
+    if (targetSlot) {
+      const equipped = bot.inventory.slots[targetSlot]
+      if (equipped && equipped.name === item_name) {
+        return res.json({ success: true, message: `${item_name} already equipped in ${destination}` })
+      }
+    }
+    // Also check hand slot (mainhand = slot 36+hotbar selection)
+    if (!destination || destination === 'hand') {
+      const heldItem = bot.heldItem
+      if (heldItem && heldItem.name === item_name) {
+        return res.json({ success: true, message: `${item_name} already in hand` })
+      }
+    }
+
     const item = bot.inventory.items().find(i => i.name === item_name)
     if (!item) return res.json({ success: false, message: `No ${item_name} in inventory` })
 
@@ -1125,6 +1469,12 @@ app.post('/action/craft', async (req, res) => {
     })
 
     if (craftingTable) {
+      // Close any open window first to avoid stale window issues
+      if (bot.currentWindow) {
+        bot.closeWindow(bot.currentWindow)
+        await new Promise(r => setTimeout(r, 300))
+      }
+
       const timeout = setTimeout(() => { bot.pathfinder.setGoal(null) }, 15000)
       await bot.pathfinder.goto(new goals.GoalNear(
         craftingTable.position.x, craftingTable.position.y, craftingTable.position.z, 2
@@ -1133,8 +1483,30 @@ app.post('/action/craft', async (req, res) => {
 
       recipes = bot.recipesFor(item.id, null, 1, craftingTable)
       if (recipes.length) {
-        await bot.craft(recipes[0], craftCount, craftingTable)
-        return res.json({ success: true, message: `Crafted ${craftCount}x ${item_name} (at crafting table)` })
+        // Retry up to 2 times on windowOpen timeout
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            // Re-find the crafting table block reference (may go stale)
+            const freshTable = bot.findBlock({
+              matching: b => b.name === 'crafting_table',
+              maxDistance: 6
+            })
+            const tableRef = freshTable || craftingTable
+            await bot.craft(recipes[0], craftCount, tableRef)
+            return res.json({ success: true, message: `Crafted ${craftCount}x ${item_name} (at crafting table)` })
+          } catch (craftErr) {
+            if (craftErr.message.includes('windowOpen') && attempt < 2) {
+              console.log(`   ⚠️ Craft windowOpen failed (attempt ${attempt + 1}/3), retrying...`)
+              // Close any stuck window and wait before retry
+              if (bot.currentWindow) {
+                bot.closeWindow(bot.currentWindow)
+              }
+              await new Promise(r => setTimeout(r, 1000))
+              continue
+            }
+            throw craftErr  // Non-windowOpen error or final attempt → propagate
+          }
+        }
       }
 
       return res.json({
@@ -1611,146 +1983,118 @@ app.post('/action/escape_water', async (req, res) => {
   }
 })
 
-// POST /action/dig_shelter - Emergency shelter: dig into ground and seal
+// POST /action/dig_shelter - Emergency shelter: dig deep shaft and hide underground
 app.post('/action/dig_shelter', async (req, res) => {
   if (!botReady) return res.status(503).json({ error: 'Bot not ready' })
   try {
-    const pos = bot.entity.position.floored()
+    const startPos = bot.entity.position.floored()
+    const depth = 8  // dig 8 blocks deep — safely underground
     let dug = 0
 
-    bot.chat('Digging emergency shelter!')
+    bot.chat('Digging underground!')
 
-    // Auto-equip best pickaxe/shovel
+    // Auto-equip best pickaxe
     await autoEquipBestTool('stone')
 
-    // Blocks we can use to seal the entrance (defined early so we can check during digging)
-    const sealBlocks = ['dirt', 'cobblestone', 'stone', 'andesite', 'diorite', 'granite',
+    const sealBlocks = ['cobblestone', 'dirt', 'stone', 'andesite', 'diorite', 'granite',
       'deepslate', 'oak_planks', 'spruce_planks', 'birch_planks', 'sandstone',
       'netherrack', 'oak_log', 'spruce_log', 'birch_log', 'sand', 'gravel']
 
-    // Helper: count seal-able blocks in inventory
-    const countSealBlocks = () => bot.inventory.items()
-      .filter(i => sealBlocks.includes(i.name))
-      .reduce((sum, i) => sum + i.count, 0)
-
-    // Step 1: Collect surface blocks for sealing BEFORE digging the room
-    // Surface blocks (dirt, grass, sand) drop items even without tools
-    const surfaceDiggable = ['grass_block', 'dirt', 'sand', 'gravel', 'snow_block', 'clay']
-    for (let dx = -1; dx <= 1 && countSealBlocks() < 2; dx++) {
-      for (let dz = -1; dz <= 1 && countSealBlocks() < 2; dz++) {
-        // Skip the block directly under the bot (we'll dig that as entrance)
-        if (dx === 0 && dz === 0) continue
-        const surface = bot.blockAt(new Vec3(pos.x + dx, pos.y, pos.z + dz))
-        if (surface && surfaceDiggable.includes(surface.name)) {
-          try {
-            await bot.dig(surface)
-            dug++
-          } catch (e) { /* skip */ }
+    // Step 1: Dig straight down (1x1 shaft)
+    for (let i = 1; i <= depth; i++) {
+      const block = bot.blockAt(new Vec3(startPos.x, startPos.y - i, startPos.z))
+      if (block && block.name !== 'air' && block.name !== 'cave_air' && block.boundingBox === 'block') {
+        // Safety: don't dig into lava or water
+        if (block.name === 'lava' || block.name === 'flowing_lava' ||
+            block.name === 'water' || block.name === 'flowing_water') {
+          console.log(`[dig_shelter] Stopping at depth ${i}: ${block.name} detected`)
+          break
         }
-        // Also try one block above surface (tall grass etc won't help, but dirt hills will)
-        if (countSealBlocks() < 2) {
-          const above = bot.blockAt(new Vec3(pos.x + dx, pos.y + 1, pos.z + dz))
-          if (above && surfaceDiggable.includes(above.name)) {
-            try {
-              await bot.dig(above)
-              dug++
-            } catch (e) {}
-          }
-        }
-      }
-    }
-
-    // Step 2: Dig entrance (1 block down)
-    const entranceBlock = bot.blockAt(pos.offset(0, -1, 0))
-    if (entranceBlock && entranceBlock.name !== 'air') {
-      await bot.dig(entranceBlock)
-      dug++
-    }
-
-    // Step 3: Drop down
-    await new Promise(resolve => setTimeout(resolve, 500))
-
-    // Step 4: Dig a 3x3x3 chamber below
-    const roomY = pos.y - 2
-    for (let dx = -1; dx <= 1; dx++) {
-      for (let dz = -1; dz <= 1; dz++) {
-        for (let dy = 0; dy <= 2; dy++) {
-          const target = new Vec3(pos.x + dx, roomY + dy, pos.z + dz)
-          const block = bot.blockAt(target)
-          if (block && block.name !== 'air' && block.boundingBox === 'block') {
-            try {
-              await bot.dig(block)
-              dug++
-            } catch (e) { /* some blocks may not be diggable */ }
-          }
-        }
-      }
-    }
-
-    // Step 5: Dig the entrance shaft (2 blocks down from surface)
-    for (let dy = -1; dy >= -2; dy--) {
-      const shaft = bot.blockAt(new Vec3(pos.x, pos.y + dy, pos.z))
-      if (shaft && shaft.name !== 'air' && shaft.boundingBox === 'block') {
         try {
-          await bot.dig(shaft)
+          await bot.dig(block)
+          dug++
+        } catch (e) {
+          console.log(`[dig_shelter] Dig failed at depth ${i}: ${e.message}`)
+          break
+        }
+      }
+    }
+
+    // Step 2: Wait for bot to fall into the shaft
+    await new Promise(r => setTimeout(r, 1500))
+
+    // Step 3: Dig a 1x2 pocket to the side (so bot has room to stand)
+    const botPos = bot.entity.position.floored()
+    for (let dy = 0; dy <= 1; dy++) {
+      const block = bot.blockAt(new Vec3(botPos.x + 1, botPos.y + dy, botPos.z))
+      if (block && block.name !== 'air' && block.boundingBox === 'block') {
+        try {
+          await bot.dig(block)
           dug++
         } catch (e) {}
       }
     }
 
-    // Step 6: Move into the room
-    try {
-      const roomCenter = new Vec3(pos.x, roomY, pos.z)
-      await bot.pathfinder.goto(new goals.GoalNear(roomCenter.x, roomCenter.y, roomCenter.z, 0))
-    } catch (e) { /* best effort */ }
-
-    await new Promise(resolve => setTimeout(resolve, 300))
-
-    // Step 7: Seal the entrance from below
+    // Step 4: Seal the shaft top (place block above head to close entrance)
     let sealed = false
-    for (const blockName of sealBlocks) {
-      const item = bot.inventory.items().find(i => i.name === blockName)
-      if (item) {
-        try {
-          // Seal the entrance shaft from below
-          const sealPos = new Vec3(pos.x, pos.y - 1, pos.z)
-          const refBlock = bot.blockAt(sealPos.offset(0, -1, 0))
-          if (refBlock && refBlock.name !== 'air') {
-            await bot.equip(item, 'hand')
-            await bot.placeBlock(refBlock, new Vec3(0, 1, 0))
-            sealed = true
+    const sealItem = bot.inventory.items().find(i => sealBlocks.includes(i.name))
+    if (sealItem) {
+      try {
+        await bot.equip(sealItem, 'hand')
+        // Find a solid wall block adjacent to the shaft opening to place against
+        const sealY = botPos.y + 2  // top of head + 1
+        for (const offset of [new Vec3(0, 1, 0), new Vec3(1, 0, 0), new Vec3(-1, 0, 0), new Vec3(0, 0, 1), new Vec3(0, 0, -1)]) {
+          const refBlock = bot.blockAt(new Vec3(botPos.x, sealY, botPos.z).plus(offset))
+          if (refBlock && refBlock.name !== 'air' && refBlock.boundingBox === 'block') {
+            const faceDir = new Vec3(-offset.x, -offset.y, -offset.z)
+            try {
+              await bot.placeBlock(refBlock, faceDir)
+              sealed = true
+              break
+            } catch (e) {}
           }
-          // Also seal the surface level
-          const surfaceRef = bot.blockAt(new Vec3(pos.x, pos.y, pos.z).offset(1, -1, 0))
-          if (surfaceRef && surfaceRef.name !== 'air') {
-            const item2 = bot.inventory.items().find(i => i.name === blockName)
-            if (item2) {
-              await bot.equip(item2, 'hand')
-              await bot.placeBlock(surfaceRef, new Vec3(-1, 1, 0))
-            }
-          }
-        } catch (e) { /* sealing is best-effort */ }
-        break
-      }
+        }
+      } catch (e) { /* best effort */ }
     }
 
-    const sealMsg = sealed ? 'Entrance sealed!' : 'Warning: could not seal entrance (no blocks to place). Place a block above to close it.'
-    bot.chat(`Underground shelter ready! ${sealMsg}`)
+    const sealMsg = sealed ? 'Sealed!' : 'Warning: could not seal entrance (no blocks to place)'
+    const finalDepth = Math.round(startPos.y - bot.entity.position.y)
+    bot.chat(`Underground! (${finalDepth} blocks deep) ${sealMsg}`)
 
     res.json({
       success: true,
-      message: `Dug emergency underground shelter (${dug} blocks mined). ${sealMsg} You are safe from mobs down here.`
+      message: `Dug ${finalDepth} blocks deep (${dug} mined). ${sealMsg}`
     })
   } catch (err) {
     res.json({ success: false, message: err.message })
   }
 })
 
+// ── Helper: short-distance move for tunneling (pathfinder + fallback) ──
+async function tunnelMove(target) {
+  const t = setTimeout(() => { try { bot.pathfinder.setGoal(null) } catch(e) {} }, 5000)
+  try {
+    await bot.pathfinder.goto(new goals.GoalNear(target.x, target.y, target.z, 1))
+  } catch (e) {
+    // Pathfinder failed — try looking and walking toward target
+    try {
+      const lookVec = new Vec3(target.x + 0.5, target.y + bot.entity.height, target.z + 0.5)
+      await bot.lookAt(lookVec)
+      bot.setControlState('forward', true)
+      await new Promise(r => setTimeout(r, 800))
+      bot.setControlState('forward', false)
+      await new Promise(r => setTimeout(r, 200))
+    } catch (e2) { /* best effort */ }
+  } finally {
+    clearTimeout(t)
+  }
+}
+
 // POST /action/dig_down - Mine downward in a staircase pattern (for finding ores/caves)
 app.post('/action/dig_down', async (req, res) => {
   if (!botReady) return res.status(503).json({ error: 'Bot not ready' })
   try {
-    const { depth, target_y } = req.body
+    const { depth, target_y, emergency } = req.body
     const maxDepth = depth || 10
     const pos = bot.entity.position.floored()
     const targetY = target_y || (pos.y - maxDepth)
@@ -1762,10 +2106,15 @@ app.post('/action/dig_down', async (req, res) => {
     // Auto-equip best pickaxe
     const digTool = await autoEquipBestTool('stone')
     if (!digTool) {
-      return res.json({
-        success: false,
-        message: 'Cannot dig without a pickaxe! Craft one first: wood → planks → sticks → crafting_table → wooden_pickaxe → mine cobblestone → stone_pickaxe.'
-      })
+      if (emergency) {
+        // Emergency (night evasion etc.) — dig by hand through dirt/gravel
+        console.log('[dig_down] EMERGENCY: No pickaxe — digging by hand')
+      } else {
+        return res.json({
+          success: false,
+          message: 'Cannot dig without a pickaxe! Craft one first: wood → planks → sticks → crafting_table → wooden_pickaxe.'
+        })
+      }
     }
 
     // Staircase pattern: dig 2 blocks forward + 1 down, repeat
@@ -1789,6 +2138,26 @@ app.post('/action/dig_down', async (req, res) => {
       // Dig forward (2 blocks high for the player)
       const forward = currentPos.offset(dir.x, 0, dir.z)
       const forwardUp = currentPos.offset(dir.x, 1, dir.z)
+      const below = currentPos.offset(dir.x, -1, dir.z)
+
+      // ── Preemptive lava scan: check blocks we're about to dig + their neighbors ──
+      const digTargets = [forward, forwardUp, below]
+      let lavaAhead = false
+      for (const target of digTargets) {
+        const nearby = scanForLava(target, 2)
+        if (nearby.length > 0) {
+          const neutralized = await tryWaterBucketOnLava(new Vec3(nearby[0].position.x, nearby[0].position.y, nearby[0].position.z))
+          if (!neutralized) {
+            bot.chat(`⚠️ LAVA detected near dig path at y=${target.y}! Changing direction.`)
+            lavaAhead = true
+            break
+          }
+        }
+      }
+      if (lavaAhead) {
+        dirIndex++  // try a different direction next iteration
+        continue
+      }
 
       const b1 = bot.blockAt(forward)
       const b2 = bot.blockAt(forwardUp)
@@ -1801,20 +2170,14 @@ app.post('/action/dig_down', async (req, res) => {
       }
 
       // Dig down
-      const below = currentPos.offset(dir.x, -1, dir.z)
       const b3 = bot.blockAt(below)
       if (b3 && b3.name !== 'air' && b3.boundingBox === 'block') {
         try { await bot.dig(b3); dug++ } catch (e) {}
       }
 
       // Move to new position
-      currentPos = below
-      try {
-        await bot.pathfinder.goto(new goals.GoalNear(currentPos.x, currentPos.y, currentPos.z, 0))
-      } catch (e) {
-        // If pathfinding fails, try simple movement
-        await new Promise(resolve => setTimeout(resolve, 300))
-      }
+      await tunnelMove(below)
+      currentPos = bot.entity.position.floored()  // Use ACTUAL position, not target
 
       dirIndex++
 
@@ -1894,6 +2257,22 @@ app.post('/action/dig_tunnel', async (req, res) => {
 
       const next = currentPos.offset(dir.x, 0, dir.z)
 
+      // ── Preemptive lava scan before digging ──
+      const lavaCheck = scanForLava(next, 2)
+      if (lavaCheck.length > 0) {
+        const neutralized = await tryWaterBucketOnLava(new Vec3(lavaCheck[0].position.x, lavaCheck[0].position.y, lavaCheck[0].position.z))
+        if (!neutralized) {
+          bot.chat('⚠️ LAVA ahead! Stopping tunnel.')
+          const oreStr = Object.keys(oresFound).length > 0
+            ? ` Ores found: ${Object.entries(oresFound).map(([k,v]) => `${k}×${v}`).join(', ')}`
+            : ''
+          return res.json({
+            success: true,
+            message: `Stopped! Lava detected at block ${i + 1}. Mined ${dug} blocks.${oreStr}`
+          })
+        }
+      }
+
       // Dig 2-high tunnel (1x2)
       for (let dy = 0; dy <= 1; dy++) {
         const target = next.offset(0, dy, 0)
@@ -1904,7 +2283,7 @@ app.post('/action/dig_tunnel', async (req, res) => {
             oresFound[block.name] = (oresFound[block.name] || 0) + 1
           }
 
-          // Safety: don't dig into lava/water
+          // Safety: don't dig into lava/water (fallback check)
           if (block.name === 'lava' || block.name === 'flowing_lava') {
             bot.chat('⚠️ LAVA ahead! Stopping tunnel.')
             const oreStr = Object.keys(oresFound).length > 0
@@ -1921,12 +2300,8 @@ app.post('/action/dig_tunnel', async (req, res) => {
       }
 
       // Move forward
-      currentPos = next
-      try {
-        await bot.pathfinder.goto(new goals.GoalNear(currentPos.x, currentPos.y, currentPos.z, 0))
-      } catch (e) {
-        await new Promise(resolve => setTimeout(resolve, 300))
-      }
+      await tunnelMove(next)
+      currentPos = bot.entity.position.floored()  // Use ACTUAL position, not target
     }
 
     const oreStr = Object.keys(oresFound).length > 0
@@ -1935,6 +2310,118 @@ app.post('/action/dig_tunnel', async (req, res) => {
     res.json({
       success: true,
       message: `Tunnel complete: ${tunnelLength} blocks ${direction} at y=${pos.y}. Mined ${dug} blocks.${oreStr}`
+    })
+  } catch (err) {
+    res.json({ success: false, message: err.message })
+  }
+})
+
+// POST /action/branch_mine - Efficient branch mining pattern (main tunnel + perpendicular branches)
+app.post('/action/branch_mine', async (req, res) => {
+  if (!botReady) return res.status(503).json({ error: 'Bot not ready' })
+  try {
+    const { direction = 'north', main_length = 20, branch_length = 5, branch_spacing = 3 } = req.body
+    const pos = bot.entity.position.floored()
+
+    const dirs = {
+      'north': new Vec3(0, 0, -1),
+      'south': new Vec3(0, 0, 1),
+      'east': new Vec3(1, 0, 0),
+      'west': new Vec3(-1, 0, 0),
+    }
+
+    const mainDir = dirs[direction]
+    if (!mainDir) {
+      return res.json({ success: false, message: `Invalid direction '${direction}'. Use: north, south, east, west.` })
+    }
+
+    // Perpendicular directions for branches
+    const perpDirs = (direction === 'north' || direction === 'south')
+      ? [new Vec3(1, 0, 0), new Vec3(-1, 0, 0)]   // east/west branches
+      : [new Vec3(0, 0, 1), new Vec3(0, 0, -1)]     // north/south branches
+
+    // Auto-equip best pickaxe
+    const tool = await autoEquipBestTool('stone')
+    if (!tool) {
+      return res.json({ success: false, message: 'Cannot branch mine without a pickaxe!' })
+    }
+
+    bot.chat(`Branch mining ${direction}, main=${main_length}, branches=${branch_length}...`)
+
+    let currentPos = pos.clone()
+    const oresFound = {}
+    let totalDug = 0
+
+    // Helper: dig a 1x2 block and track ores
+    async function digBlock(target) {
+      const block = bot.blockAt(target)
+      if (!block || block.name === 'air' || block.boundingBox !== 'block') return false
+      if (block.name === 'lava' || block.name === 'flowing_lava') return 'lava'
+      if (block.name.includes('ore')) {
+        oresFound[block.name] = (oresFound[block.name] || 0) + 1
+      }
+      try { await bot.dig(block); totalDug++ } catch (e) {}
+      return true
+    }
+
+    // Helper: dig + move one step in a direction
+    async function digStep(fromPos, dir) {
+      const next = fromPos.offset(dir.x, 0, dir.z)
+      // Preemptive lava scan before digging
+      const lavaAhead = scanForLava(next, 2)
+      if (lavaAhead.length > 0) {
+        const neutralized = await tryWaterBucketOnLava(new Vec3(lavaAhead[0].position.x, lavaAhead[0].position.y, lavaAhead[0].position.z))
+        if (!neutralized) return null  // can't proceed, lava blocking
+      }
+      const lavaCheck1 = await digBlock(next)
+      if (lavaCheck1 === 'lava') return null
+      const lavaCheck2 = await digBlock(next.offset(0, 1, 0))
+      if (lavaCheck2 === 'lava') return null
+      await tunnelMove(next)
+      return bot.entity.position.floored()  // Use ACTUAL position, not target
+    }
+
+    // ── Main tunnel with branches ──
+    for (let i = 0; i < main_length; i++) {
+      if (abortFlag) {
+        abortFlag = false
+        const oreStr = Object.entries(oresFound).map(([k,v]) => `${k}×${v}`).join(', ')
+        return res.json({ success: false, message: `Aborted branch mine after ${i} blocks. Dug ${totalDug}. Ores: ${oreStr || 'none'}` })
+      }
+
+      // Dig forward in main tunnel
+      const next = await digStep(currentPos, mainDir)
+      if (!next) {
+        const oreStr = Object.entries(oresFound).map(([k,v]) => `${k}×${v}`).join(', ')
+        return res.json({ success: true, message: `Stopped at lava after ${i} main blocks. Dug ${totalDug}. Ores: ${oreStr || 'none'}` })
+      }
+      currentPos = next
+
+      // ── Branch at intervals ──
+      if (i > 0 && i % branch_spacing === 0) {
+        const junctionPos = currentPos.clone()
+
+        for (const perpDir of perpDirs) {
+          let branchPos = junctionPos.clone()
+          for (let j = 0; j < branch_length; j++) {
+            if (abortFlag) break
+            const nextBranch = await digStep(branchPos, perpDir)
+            if (!nextBranch) break  // lava or can't proceed
+            branchPos = nextBranch
+          }
+          // Return to junction
+          const actualPos = bot.entity.position.floored()
+          if (actualPos.x !== junctionPos.x || actualPos.z !== junctionPos.z) {
+            await tunnelMove(junctionPos)
+          }
+        }
+      }
+    }
+
+    const oreStr = Object.entries(oresFound).map(([k,v]) => `${k}×${v}`).join(', ')
+    res.json({
+      success: true,
+      message: `Branch mine complete: ${main_length} main + branches at y=${pos.y}. Dug ${totalDug} blocks. Ores: ${oreStr || 'none'}`
     })
   } catch (err) {
     res.json({ success: false, message: err.message })
@@ -2198,7 +2685,9 @@ bot.once('spawn', () => {
   console.log(`📍 Position: ${bot.entity.position}`)
 
   const mcData = require('minecraft-data')(bot.version)
-  bot.pathfinder.setMovements(new Movements(bot, mcData))
+  const movements = new Movements(bot, mcData)
+  movements.allowSprinting = true
+  bot.pathfinder.setMovements(movements)
 
   botReady = true
   bot.chat('Hello! AI bot online.')
@@ -2213,6 +2702,22 @@ bot.on('chat', (username, message) => {
   })
   if (lastChatMessages.length > 50) lastChatMessages.shift()
   console.log(`💬 ${username}: ${message}`)
+})
+
+// ── Drop Collection: track mob deaths for loot pickup ──
+bot.on('entityDead', (entity) => {
+  if (!entity || !entity.position) return
+  const dist = entity.position.distanceTo(bot.entity.position)
+  if (dist < 20) {
+    pendingDrops.push({
+      position: { x: entity.position.x.toFixed(1), y: entity.position.y.toFixed(1), z: entity.position.z.toFixed(1) },
+      time: Date.now(),
+      type: entity.name || 'unknown'
+    })
+    // Expire old drops
+    pendingDrops = pendingDrops.filter(d => Date.now() - d.time < 60000)
+    console.log(`[drops] Entity ${entity.name} died ${dist.toFixed(0)}m away — tracking drop`)
+  }
 })
 
 // ── Death Tracking + Combat Detection: health snapshot every update ──
@@ -2607,6 +3112,291 @@ app.post('/action/rebuild_structure', async (req, res) => {
     }
 
     res.json({ success: true, message: msg })
+  } catch (err) {
+    res.json({ success: false, message: err.message })
+  }
+})
+
+// ============================================
+// CAVE DETECTION
+// ============================================
+app.get('/scan_caves', (req, res) => {
+  if (!botReady) return res.status(503).json({ error: 'Bot not ready' })
+  try {
+    const pos = bot.entity.position.floored()
+    const radius = parseInt(req.query.radius) || 16
+
+    // Find air/cave_air blocks below current position (= caves)
+    const airBlocks = bot.findBlocks({
+      matching: b => b.name === 'air' || b.name === 'cave_air',
+      maxDistance: radius,
+      count: 500,
+      point: pos
+    }).filter(p => p.y < pos.y - 2)  // only below us
+
+    if (airBlocks.length === 0) {
+      return res.json({ caves: [], count: 0 })
+    }
+
+    // Cluster nearby air blocks into cave candidates using simple grid bucketing
+    const bucketSize = 5
+    const buckets = {}
+    for (const p of airBlocks) {
+      const key = `${Math.floor(p.x / bucketSize)},${Math.floor(p.y / bucketSize)},${Math.floor(p.z / bucketSize)}`
+      if (!buckets[key]) buckets[key] = []
+      buckets[key].push(p)
+    }
+
+    // Sort by cluster size (largest first), take top 3
+    const clusters = Object.values(buckets)
+      .filter(c => c.length >= 3)  // at least 3 air blocks = real cave
+      .sort((a, b) => b.length - a.length)
+      .slice(0, 3)
+      .map(cluster => {
+        // Calculate center of cluster
+        const cx = cluster.reduce((s, p) => s + p.x, 0) / cluster.length
+        const cy = cluster.reduce((s, p) => s + p.y, 0) / cluster.length
+        const cz = cluster.reduce((s, p) => s + p.z, 0) / cluster.length
+        return {
+          center: { x: Math.round(cx), y: Math.round(cy), z: Math.round(cz) },
+          size: cluster.length,
+          distance: Math.round(pos.distanceTo(new Vec3(cx, cy, cz)))
+        }
+      })
+
+    res.json({ caves: clusters, count: clusters.length })
+  } catch (err) {
+    res.json({ caves: [], count: 0, error: err.message })
+  }
+})
+
+// ============================================
+// DROP COLLECTION
+// ============================================
+app.get('/pending_drops', (req, res) => {
+  if (!botReady) return res.status(503).json({ error: 'Bot not ready' })
+  pendingDrops = pendingDrops.filter(d => Date.now() - d.time < 60000)
+  res.json({ drops: pendingDrops, count: pendingDrops.length })
+})
+
+app.post('/action/collect_drops', async (req, res) => {
+  if (!botReady) return res.status(503).json({ error: 'Bot not ready' })
+  try {
+    const items = Object.values(bot.entities).filter(
+      e => e.name === 'item' && e.position.distanceTo(bot.entity.position) < 16
+    ).sort((a, b) => a.position.distanceTo(bot.entity.position) - b.position.distanceTo(bot.entity.position))
+
+    if (items.length === 0) {
+      return res.json({ success: true, message: 'No drops nearby to collect' })
+    }
+
+    let collected = 0
+    for (const item of items.slice(0, 10)) {
+      try {
+        const timeout = setTimeout(() => { bot.pathfinder.setGoal(null) }, 5000)
+        await bot.pathfinder.goto(new goals.GoalNear(item.position.x, item.position.y, item.position.z, 0))
+        clearTimeout(timeout)
+        collected++
+        await new Promise(r => setTimeout(r, 200))
+      } catch (e) { /* item may have been collected already */ }
+    }
+    pendingDrops = []
+    res.json({ success: true, message: `Collected ${collected} drop(s) from ${items.length} nearby` })
+  } catch (err) {
+    res.json({ success: false, message: err.message })
+  }
+})
+
+// ============================================
+// SHIELD BLOCKING
+// ============================================
+app.post('/action/shield_block', async (req, res) => {
+  if (!botReady) return res.status(503).json({ error: 'Bot not ready' })
+  try {
+    const duration = req.body.duration || 2000
+
+    // Check for shield in off-hand first, then inventory
+    const offhand = bot.inventory.slots[45]
+    if (!offhand || offhand.name !== 'shield') {
+      const shield = bot.inventory.items().find(i => i.name === 'shield')
+      if (!shield) return res.json({ success: false, message: 'No shield available' })
+      await bot.equip(shield, 'off-hand')
+    }
+
+    // Activate shield (right-click off-hand = block)
+    bot.activateItem(true)  // true = off-hand
+    await new Promise(r => setTimeout(r, duration))
+    bot.deactivateItem()
+
+    res.json({ success: true, message: `Shield blocked for ${duration}ms` })
+  } catch (err) {
+    res.json({ success: false, message: err.message })
+  }
+})
+
+// ============================================
+// CHEST MANAGEMENT
+// ============================================
+app.post('/action/open_chest', async (req, res) => {
+  if (!botReady) return res.status(503).json({ error: 'Bot not ready' })
+  try {
+    const chest = bot.findBlock({ matching: b => b.name === 'chest' || b.name === 'trapped_chest' || b.name === 'barrel', maxDistance: 32 })
+    if (!chest) return res.json({ success: false, message: 'No chest/barrel nearby' })
+
+    const timeout = setTimeout(() => { bot.pathfinder.setGoal(null) }, 15000)
+    await bot.pathfinder.goto(new goals.GoalNear(chest.position.x, chest.position.y, chest.position.z, 2))
+    clearTimeout(timeout)
+
+    const window = await bot.openContainer(chest)
+    const items = window.containerItems().map(i => ({ name: i.name, count: i.count }))
+    window.close()
+
+    res.json({ success: true, message: `Chest contents: ${items.length} stacks`, items })
+  } catch (err) {
+    res.json({ success: false, message: err.message })
+  }
+})
+
+app.post('/action/store_items', async (req, res) => {
+  if (!botReady) return res.status(503).json({ error: 'Bot not ready' })
+  try {
+    // Items to always keep (tools, weapons, food, building essentials)
+    const keepPatterns = [
+      '_pickaxe', '_sword', '_axe', '_shovel', '_hoe',
+      '_helmet', '_chestplate', '_leggings', '_boots',
+      'shield', 'torch', 'bucket', 'water_bucket',
+      'crafting_table', 'furnace'
+    ]
+    const keepWithLimit = {
+      'cobblestone': 32, 'dirt': 16, 'torch': 32,
+      'cooked_beef': 16, 'cooked_porkchop': 16, 'cooked_chicken': 16,
+      'bread': 16, 'apple': 16, 'stick': 16, 'coal': 16,
+      'oak_planks': 16, 'spruce_planks': 16, 'birch_planks': 16
+    }
+
+    const chest = bot.findBlock({ matching: b => b.name === 'chest' || b.name === 'trapped_chest' || b.name === 'barrel', maxDistance: 32 })
+    if (!chest) return res.json({ success: false, message: 'No chest nearby to store items' })
+
+    const timeout = setTimeout(() => { bot.pathfinder.setGoal(null) }, 15000)
+    await bot.pathfinder.goto(new goals.GoalNear(chest.position.x, chest.position.y, chest.position.z, 2))
+    clearTimeout(timeout)
+
+    const window = await bot.openContainer(chest)
+    let stored = 0
+
+    for (const item of bot.inventory.items()) {
+      const isEssential = keepPatterns.some(p => item.name.includes(p))
+
+      if (isEssential) {
+        // Check if we have more than the keep limit
+        const limit = keepWithLimit[item.name]
+        if (limit && item.count > limit) {
+          try {
+            await window.deposit(item.type, null, item.count - limit)
+            stored++
+          } catch (e) { /* chest may be full */ }
+        }
+        // Essential items: keep all if no limit defined
+      } else {
+        // Non-essential: check if there's a keep limit
+        const limit = keepWithLimit[item.name]
+        if (limit && item.count > limit) {
+          try {
+            await window.deposit(item.type, null, item.count - limit)
+            stored++
+          } catch (e) {}
+        } else if (!limit) {
+          // No limit defined and not essential → store all
+          try {
+            await window.deposit(item.type, null, item.count)
+            stored++
+          } catch (e) {}
+        }
+      }
+    }
+
+    window.close()
+    res.json({ success: true, message: `Stored ${stored} item stacks in chest` })
+  } catch (err) {
+    res.json({ success: false, message: err.message })
+  }
+})
+
+app.post('/action/retrieve_items', async (req, res) => {
+  if (!botReady) return res.status(503).json({ error: 'Bot not ready' })
+  try {
+    const { item_name, count = 1 } = req.body
+    if (!item_name) return res.json({ success: false, message: 'item_name required' })
+
+    const chest = bot.findBlock({ matching: b => b.name === 'chest' || b.name === 'trapped_chest' || b.name === 'barrel', maxDistance: 32 })
+    if (!chest) return res.json({ success: false, message: 'No chest nearby' })
+
+    const timeout = setTimeout(() => { bot.pathfinder.setGoal(null) }, 15000)
+    await bot.pathfinder.goto(new goals.GoalNear(chest.position.x, chest.position.y, chest.position.z, 2))
+    clearTimeout(timeout)
+
+    const window = await bot.openContainer(chest)
+    const item = window.containerItems().find(i => i.name === item_name)
+    if (!item) {
+      window.close()
+      return res.json({ success: false, message: `No ${item_name} in chest` })
+    }
+
+    const retrieveCount = Math.min(count, item.count)
+    await window.withdraw(item.type, null, retrieveCount)
+    window.close()
+
+    res.json({ success: true, message: `Retrieved ${retrieveCount} ${item_name} from chest` })
+  } catch (err) {
+    res.json({ success: false, message: err.message })
+  }
+})
+
+// ============================================
+// BUCKET USAGE
+// ============================================
+app.post('/action/use_bucket', async (req, res) => {
+  if (!botReady) return res.status(503).json({ error: 'Bot not ready' })
+  try {
+    const { action, x, y, z } = req.body
+    // action: "fill_water", "place_water", "fill_lava", "place_lava"
+
+    if (action === 'fill_water' || action === 'fill_lava') {
+      const bucket = bot.inventory.items().find(i => i.name === 'bucket')
+      if (!bucket) return res.json({ success: false, message: 'No empty bucket in inventory' })
+
+      const targetType = action === 'fill_water' ? 'water' : 'lava'
+      const source = bot.findBlock({
+        matching: b => b.name === targetType || b.name === `flowing_${targetType}`,
+        maxDistance: 6
+      })
+      if (!source) return res.json({ success: false, message: `No ${targetType} source nearby` })
+
+      await bot.equip(bucket, 'hand')
+      await bot.activateBlock(source)
+      res.json({ success: true, message: `Filled bucket with ${targetType}` })
+    }
+    else if (action === 'place_water' || action === 'place_lava') {
+      const itemName = action === 'place_water' ? 'water_bucket' : 'lava_bucket'
+      const item = bot.inventory.items().find(i => i.name === itemName)
+      if (!item) return res.json({ success: false, message: `No ${itemName} in inventory` })
+
+      await bot.equip(item, 'hand')
+      if (x !== undefined && y !== undefined && z !== undefined) {
+        const targetBlock = bot.blockAt(new Vec3(x, y, z))
+        if (targetBlock) {
+          await bot.activateBlock(targetBlock)
+        } else {
+          bot.activateItem()
+        }
+      } else {
+        bot.activateItem()
+      }
+      res.json({ success: true, message: `Placed ${itemName}` })
+    }
+    else {
+      return res.json({ success: false, message: `Unknown bucket action: ${action}. Use: fill_water, place_water, fill_lava, place_lava` })
+    }
   } catch (err) {
     res.json({ success: false, message: err.message })
   }
