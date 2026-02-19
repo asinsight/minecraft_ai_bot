@@ -36,17 +36,28 @@ class DeathSnapshot:
     recent_actions: list[str]         # last 5 agent actions
     active_goal: str                  # what goal was active
     death_message: str                # Minecraft death message if available
-    
+    death_category: str = "unknown"   # combat, starvation, drowning, fall, fire, explosion, unknown
+    killed_by: Optional[str] = None   # mob type that killed the bot
+    recent_combat: list = None        # recent combat events [{type, damage, time, ...}]
+
     def summary(self) -> str:
         inv = ", ".join(f"{i['name']}x{i['count']}" for i in self.inventory[:10]) or "empty"
         mobs = ", ".join(f"{e['type']}({e['distance']}m)" for e in self.nearby_entities[:5]) or "none"
         actions = " → ".join(self.recent_actions[-5:]) or "none"
-        
+        combat_str = "none"
+        if self.recent_combat:
+            combat_str = ", ".join(
+                f"{c.get('type','?')} dmg={c.get('damage','?')}" for c in self.recent_combat[:5]
+            )
+
         return (
             f"=== DEATH SNAPSHOT ===\n"
             f"Time: {self.time_of_day} | Position: ({self.position.get('x','?')}, {self.position.get('y','?')}, {self.position.get('z','?')})\n"
             f"Health before death: {self.health_before}/20 | Hunger: {self.hunger_before}/20\n"
             f"Death message: {self.death_message}\n"
+            f"Death category: {self.death_category}\n"
+            f"Killed by: {self.killed_by or 'unknown'}\n"
+            f"Recent combat: {combat_str}\n"
             f"Nearby mobs: {mobs}\n"
             f"Inventory: {inv}\n"
             f"Recent actions: {actions}\n"
@@ -187,6 +198,9 @@ class DeathAnalyzer:
                 recent_actions=list(self.recent_actions[-10:]),
                 active_goal=latest.get("active_goal", "none"),
                 death_message=latest.get("message", "unknown cause"),
+                death_category=latest.get("category", "unknown"),
+                killed_by=latest.get("killed_by"),
+                recent_combat=latest.get("recent_combat", []),
             )
             
             self.death_log.append(snapshot)
@@ -227,13 +241,19 @@ class DeathAnalyzer:
     def generate_analysis_prompt(self, snapshot: DeathSnapshot) -> str:
         """Generate a prompt for the LLM to analyze the death."""
         existing = self.get_lessons_prompt()
-        
+
         return (
             f"You just DIED in Minecraft. Analyze what went wrong and how to prevent it.\n\n"
             f"{snapshot.summary()}\n\n"
             f"Existing lessons you already know:\n{existing}\n\n"
+            f"IMPORTANT ANALYSIS RULES:\n"
+            f"- If death_category is 'combat' or killed_by is set → the PRIMARY cause is MOB ATTACK, not starvation\n"
+            f"- 'starvation' as sole death cause is ONLY valid on Hard difficulty; on Normal, starvation only reduces HP to 0.5\n"
+            f"- If hunger was low AND mobs were nearby → cause is 'mob attack while weakened by hunger', NOT 'starvation'\n"
+            f"- Use the recent_combat events to identify the actual killer mob\n"
+            f"- Be SPECIFIC: name the mob type, describe the situation (night, no armor, underground, etc.)\n\n"
             f"Respond in this EXACT format (3 lines only):\n"
-            f"CAUSE: <one sentence describing what killed you>\n"
+            f"CAUSE: <one sentence describing what killed you — be specific about the mob/event>\n"
             f"LESSON: <one actionable rule to follow in the future>\n"
             f"SEVERITY: <low/medium/high>\n\n"
             f"Examples:\n"

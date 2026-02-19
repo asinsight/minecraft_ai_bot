@@ -1,0 +1,588 @@
+{
+  "defeat_ender_dragon": {
+    "name": "defeat_ender_dragon",
+    "description": "Defeat the Ender Dragon!",
+    "source": "builtin",
+    "phases": [
+      {
+        "id": "survival",
+        "name": "Phase 1: Basic Survival",
+        "description": "Tools, food, shelter"
+      },
+      {
+        "id": "iron",
+        "name": "Phase 2: Iron Age",
+        "description": "Iron gear"
+      },
+      {
+        "id": "diamond",
+        "name": "Phase 3: Diamond Age",
+        "description": "Diamond gear"
+      },
+      {
+        "id": "nether",
+        "name": "Phase 4: The Nether",
+        "description": "Blaze rods"
+      },
+      {
+        "id": "ender",
+        "name": "Phase 5: Eyes of Ender",
+        "description": "Enderpearls + eyes"
+      },
+      {
+        "id": "end",
+        "name": "Phase 6: The End",
+        "description": "Defeat the dragon"
+      }
+    ],
+    "tasks": [
+      {
+        "id": "get_wood",
+        "description": "Gather wood and make planks",
+        "chain_name": "get_wood",
+        "requires": [],
+        "phase": "survival",
+        "optional": false,
+        "completion_items": {
+          "oak_planks": 12
+        },
+        "completion_blocks_placed": []
+      },
+      {
+        "id": "make_crafting_table",
+        "description": "Make and place crafting table",
+        "chain_name": "make_crafting_table",
+        "requires": [
+          "get_wood"
+        ],
+        "phase": "survival",
+        "optional": false,
+        "completion_items": {},
+        "completion_blocks_placed": [
+          "crafting_table"
+        ]
+      },
+      {
+        "id": "make_wooden_pickaxe",
+        "description": "Craft wooden pickaxe",
+        "chain_name": "make_wooden_pickaxe",
+        "requires": [
+          "make_crafting_table"
+        ],
+        "phase": "survival",
+        "optional": false,
+        "completion_items": {
+          "wooden_pickaxe": 1
+        },
+        "completion_blocks_placed": []
+      },
+      {
+        "id": "make_stone_pickaxe",
+        "description": "Craft stone pickaxe",
+        "chain_name": "make_stone_pickaxe",
+        "requires": [
+          "make_wooden_pickaxe"
+        ],
+        "phase": "survival",
+        "optional": false,
+        "completion_items": {
+          "stone_pickaxe": 1
+        },
+        "completion_blocks_placed": []
+      },
+      {
+        "id": "find_food",
+        "description": "Hunt animals for food",
+        "chain_name": "find_food",
+        "requires": [],
+        "phase": "survival",
+        "optional": false,
+        "completion_items": {},
+        "completion_blocks_placed": []
+      },
+      {
+        "id": "build_shelter",
+        "description": "Build a shelter",
+        "chain_name": "build_shelter",
+        "requires": [],
+        "phase": "survival",
+        "optional": false,
+        "completion_items": {},
+        "completion_blocks_placed": []
+      },
+      {
+        "id": "make_iron_pickaxe",
+        "description": "Craft iron pickaxe",
+        "chain_name": "make_iron_pickaxe",
+        "requires": [
+          "make_stone_pickaxe"
+        ],
+        "phase": "iron",
+        "optional": false,
+        "completion_items": {
+          "iron_pickaxe": 1
+        },
+        "completion_blocks_placed": []
+      },
+      {
+        "id": "make_iron_sword",
+        "description": "Craft iron sword",
+        "chain_name": "make_iron_sword",
+        "requires": [
+          "make_stone_pickaxe"
+        ],
+        "phase": "iron",
+        "optional": false,
+        "completion_items": {
+          "iron_sword": 1
+        },
+        "completion_blocks_placed": []
+      },
+      {
+        "id": "make_iron_armor",
+        "description": "Craft iron chestplate",
+        "chain_name": "make_iron_armor",
+        "requires": [
+          "make_stone_pickaxe"
+        ],
+        "phase": "iron",
+        "optional": true,
+        "completion_items": {
+          "iron_chestplate": 1
+        },
+        "completion_blocks_placed": []
+      },
+      {
+        "id": "make_shield",
+        "description": "Craft a shield",
+        "chain_name": "make_shield",
+        "requires": [
+          "make_iron_sword"
+        ],
+        "phase": "iron",
+        "optional": true,
+        "completion_items": {
+          "shield": 1
+        },
+        "completion_blocks_placed": []
+      },
+      {
+        "id": "make_bucket",
+        "description": "Craft a bucket",
+        "chain_name": "make_bucket",
+        "requires": [
+          "make_stone_pickaxe"
+        ],
+        "phase": "iron",
+        "optional": false,
+        "completion_items": {
+          "bucket": 1
+        },
+        "completion_blocks_placed": []
+      },
+      {
+        "id": "mine_diamonds",
+        "description": "Mine 5+ diamonds",
+        "chain_name": "mine_diamonds",
+        "requires": [
+          "make_iron_pickaxe"
+        ],
+        "phase": "diamond",
+        "optional": false,
+        "completion_items": {
+          "diamond": 5
+        },
+        "completion_blocks_placed": []
+      },
+      {
+        "id": "make_diamond_pickaxe",
+        "description": "Craft diamond pickaxe",
+        "chain_name": "make_diamond_pickaxe",
+        "requires": [
+          "mine_diamonds"
+        ],
+        "phase": "diamond",
+        "optional": false,
+        "completion_items": {
+          "diamond_pickaxe": 1
+        },
+        "completion_blocks_placed": []
+      },
+      {
+        "id": "make_diamond_sword",
+        "description": "Craft diamond sword",
+        "chain_name": "make_diamond_sword",
+        "requires": [
+          "mine_diamonds"
+        ],
+        "phase": "diamond",
+        "optional": false,
+        "completion_items": {
+          "diamond_sword": 1
+        },
+        "completion_blocks_placed": []
+      },
+      {
+        "id": "get_obsidian",
+        "description": "Mine 10 obsidian",
+        "chain_name": "mine_diamonds",
+        "requires": [
+          "make_diamond_pickaxe",
+          "make_bucket"
+        ],
+        "phase": "nether",
+        "optional": false,
+        "completion_items": {
+          "obsidian": 10
+        },
+        "completion_blocks_placed": []
+      },
+      {
+        "id": "build_portal",
+        "description": "Build nether portal",
+        "chain_name": "",
+        "requires": [
+          "get_obsidian"
+        ],
+        "phase": "nether",
+        "optional": false,
+        "completion_items": {},
+        "completion_blocks_placed": []
+      },
+      {
+        "id": "find_fortress",
+        "description": "Find nether fortress",
+        "chain_name": "",
+        "requires": [
+          "build_portal"
+        ],
+        "phase": "nether",
+        "optional": false,
+        "completion_items": {},
+        "completion_blocks_placed": []
+      },
+      {
+        "id": "kill_blazes",
+        "description": "Kill blazes for 7 rods",
+        "chain_name": "",
+        "requires": [
+          "find_fortress",
+          "make_diamond_sword"
+        ],
+        "phase": "nether",
+        "optional": false,
+        "completion_items": {
+          "blaze_rod": 7
+        },
+        "completion_blocks_placed": []
+      },
+      {
+        "id": "craft_blaze_powder",
+        "description": "Craft blaze powder",
+        "chain_name": "",
+        "requires": [
+          "kill_blazes"
+        ],
+        "phase": "ender",
+        "optional": false,
+        "completion_items": {
+          "blaze_powder": 7
+        },
+        "completion_blocks_placed": []
+      },
+      {
+        "id": "kill_endermen",
+        "description": "Kill endermen for 12 pearls",
+        "chain_name": "",
+        "requires": [
+          "make_diamond_sword"
+        ],
+        "phase": "ender",
+        "optional": false,
+        "completion_items": {
+          "ender_pearl": 12
+        },
+        "completion_blocks_placed": []
+      },
+      {
+        "id": "craft_eyes",
+        "description": "Craft 12 eyes of ender",
+        "chain_name": "",
+        "requires": [
+          "craft_blaze_powder",
+          "kill_endermen"
+        ],
+        "phase": "ender",
+        "optional": false,
+        "completion_items": {
+          "ender_eye": 12
+        },
+        "completion_blocks_placed": []
+      },
+      {
+        "id": "find_stronghold",
+        "description": "Find stronghold",
+        "chain_name": "",
+        "requires": [
+          "craft_eyes"
+        ],
+        "phase": "end",
+        "optional": false,
+        "completion_items": {},
+        "completion_blocks_placed": []
+      },
+      {
+        "id": "activate_portal",
+        "description": "Activate end portal",
+        "chain_name": "",
+        "requires": [
+          "find_stronghold"
+        ],
+        "phase": "end",
+        "optional": false,
+        "completion_items": {},
+        "completion_blocks_placed": []
+      },
+      {
+        "id": "defeat_dragon",
+        "description": "Defeat the Ender Dragon!",
+        "chain_name": "",
+        "requires": [
+          "activate_portal"
+        ],
+        "phase": "end",
+        "optional": false,
+        "completion_items": {},
+        "completion_blocks_placed": []
+      }
+    ]
+  },
+  "full_iron_gear": {
+    "name": "full_iron_gear",
+    "description": "Get full iron gear",
+    "source": "builtin",
+    "phases": [
+      {
+        "id": "basic",
+        "name": "Phase 1: Basics",
+        "description": "Wood and stone"
+      },
+      {
+        "id": "iron",
+        "name": "Phase 2: Iron",
+        "description": "Full iron gear"
+      }
+    ],
+    "tasks": [
+      {
+        "id": "get_wood",
+        "description": "Gather wood",
+        "chain_name": "get_wood",
+        "requires": [],
+        "phase": "basic",
+        "optional": false,
+        "completion_items": {
+          "oak_planks": 12
+        },
+        "completion_blocks_placed": []
+      },
+      {
+        "id": "make_crafting_table",
+        "description": "Make crafting table",
+        "chain_name": "make_crafting_table",
+        "requires": [
+          "get_wood"
+        ],
+        "phase": "basic",
+        "optional": false,
+        "completion_items": {},
+        "completion_blocks_placed": [
+          "crafting_table"
+        ]
+      },
+      {
+        "id": "make_wooden_pickaxe",
+        "description": "Wooden pickaxe",
+        "chain_name": "make_wooden_pickaxe",
+        "requires": [
+          "make_crafting_table"
+        ],
+        "phase": "basic",
+        "optional": false,
+        "completion_items": {
+          "wooden_pickaxe": 1
+        },
+        "completion_blocks_placed": []
+      },
+      {
+        "id": "make_stone_pickaxe",
+        "description": "Stone pickaxe",
+        "chain_name": "make_stone_pickaxe",
+        "requires": [
+          "make_wooden_pickaxe"
+        ],
+        "phase": "basic",
+        "optional": false,
+        "completion_items": {
+          "stone_pickaxe": 1
+        },
+        "completion_blocks_placed": []
+      },
+      {
+        "id": "make_iron_pickaxe",
+        "description": "Iron pickaxe",
+        "chain_name": "make_iron_pickaxe",
+        "requires": [
+          "make_stone_pickaxe"
+        ],
+        "phase": "iron",
+        "optional": false,
+        "completion_items": {
+          "iron_pickaxe": 1
+        },
+        "completion_blocks_placed": []
+      },
+      {
+        "id": "make_iron_sword",
+        "description": "Iron sword",
+        "chain_name": "make_iron_sword",
+        "requires": [
+          "make_stone_pickaxe"
+        ],
+        "phase": "iron",
+        "optional": false,
+        "completion_items": {
+          "iron_sword": 1
+        },
+        "completion_blocks_placed": []
+      },
+      {
+        "id": "make_iron_armor",
+        "description": "Iron chestplate",
+        "chain_name": "make_iron_armor",
+        "requires": [
+          "make_stone_pickaxe"
+        ],
+        "phase": "iron",
+        "optional": false,
+        "completion_items": {
+          "iron_chestplate": 1
+        },
+        "completion_blocks_placed": []
+      },
+      {
+        "id": "make_shield",
+        "description": "Shield",
+        "chain_name": "make_shield",
+        "requires": [
+          "make_iron_sword"
+        ],
+        "phase": "iron",
+        "optional": false,
+        "completion_items": {
+          "shield": 1
+        },
+        "completion_blocks_placed": []
+      }
+    ]
+  },
+  "cozy_base": {
+    "name": "cozy_base",
+    "description": "Build a cozy base",
+    "source": "builtin",
+    "phases": [
+      {
+        "id": "gather",
+        "name": "Phase 1: Gather",
+        "description": "Collect materials"
+      },
+      {
+        "id": "build",
+        "name": "Phase 2: Build",
+        "description": "Build base"
+      }
+    ],
+    "tasks": [
+      {
+        "id": "get_wood",
+        "description": "Get lots of wood",
+        "chain_name": "get_wood",
+        "requires": [],
+        "phase": "gather",
+        "optional": false,
+        "completion_items": {
+          "oak_planks": 32
+        },
+        "completion_blocks_placed": []
+      },
+      {
+        "id": "get_stone",
+        "description": "Mine 64+ cobblestone",
+        "chain_name": "mine_stone",
+        "requires": [],
+        "phase": "gather",
+        "optional": false,
+        "completion_items": {
+          "cobblestone": 64
+        },
+        "completion_blocks_placed": []
+      },
+      {
+        "id": "make_crafting_table",
+        "description": "Place crafting table",
+        "chain_name": "make_crafting_table",
+        "requires": [
+          "get_wood"
+        ],
+        "phase": "build",
+        "optional": false,
+        "completion_items": {},
+        "completion_blocks_placed": [
+          "crafting_table"
+        ]
+      },
+      {
+        "id": "build_main_shelter",
+        "description": "Build shelter",
+        "chain_name": "build_shelter",
+        "requires": [
+          "get_stone"
+        ],
+        "phase": "build",
+        "optional": false,
+        "completion_items": {},
+        "completion_blocks_placed": [
+          "oak_door"
+        ]
+      },
+      {
+        "id": "place_furnace",
+        "description": "Place furnace",
+        "chain_name": "place_furnace",
+        "requires": [
+          "get_stone"
+        ],
+        "phase": "build",
+        "optional": false,
+        "completion_items": {},
+        "completion_blocks_placed": [
+          "furnace"
+        ]
+      },
+      {
+        "id": "place_chests",
+        "description": "Place chests",
+        "chain_name": "place_chest",
+        "requires": [
+          "get_wood"
+        ],
+        "phase": "build",
+        "optional": false,
+        "completion_items": {},
+        "completion_blocks_placed": [
+          "chest"
+        ]
+      }
+    ]
+  }
+}
