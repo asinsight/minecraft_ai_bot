@@ -175,6 +175,82 @@ class SpatialMemory:
             f"{nearest.description}"
         )
 
+    # ── Cave Management (max 10) ──
+
+    MAX_CAVES = 10
+
+    def save_cave(self, x: float, y: float, z: float, size: int = 0) -> str:
+        """Save a cave location. Skips if too close to existing cave. Keeps max MAX_CAVES."""
+        # Skip if a cave is already saved within 32 blocks
+        for name, wp in self.waypoints.items():
+            if wp.category == "cave" and wp.distance_to(x, y, z) < 32:
+                return f"Cave already known near ({x:.0f}, {y:.0f}, {z:.0f})"
+
+        # Evict oldest if at capacity
+        cave_names = sorted(
+            [n for n, wp in self.waypoints.items() if wp.category == "cave"],
+            key=lambda n: self.waypoints[n].created_at,
+        )
+        while len(cave_names) >= self.MAX_CAVES:
+            oldest = cave_names.pop(0)
+            del self.waypoints[oldest]
+
+        # Generate name
+        existing_nums = [0]
+        for n in self.waypoints:
+            if n.startswith("cave_") and n.split("_")[-1].isdigit():
+                existing_nums.append(int(n.split("_")[-1]))
+        name = f"cave_{max(existing_nums) + 1}"
+
+        desc = f"size={size}" if size else ""
+        result = self.save_location(name, "cave", x, y, z, desc)
+        print(f"   📍 Saved cave '{name}' at ({x:.0f}, {y:.0f}, {z:.0f})")
+        return result
+
+    def get_caves_sorted(self, bot_pos: tuple) -> list[dict]:
+        """Get all saved caves sorted by distance from bot. Returns list of {name, x, y, z, dist}."""
+        caves = []
+        for name, wp in self.waypoints.items():
+            if wp.category == "cave":
+                dist = wp.distance_to(*bot_pos)
+                caves.append({"name": name, "x": wp.x, "y": wp.y, "z": wp.z, "dist": dist})
+        caves.sort(key=lambda c: c["dist"])
+        return caves
+
+    # ── Shelter Management (max 3) ──
+
+    MAX_SHELTERS = 3
+
+    def save_shelter(self, x: float, y: float, z: float, description: str = "Shelter") -> str:
+        """Save a shelter location, keeping only the most recent MAX_SHELTERS."""
+        # Find all existing shelter waypoints
+        shelter_names = sorted(
+            [n for n, wp in self.waypoints.items() if wp.category == "shelter"],
+            key=lambda n: self.waypoints[n].created_at,
+        )
+
+        # Delete oldest shelters if at capacity
+        while len(shelter_names) >= self.MAX_SHELTERS:
+            oldest = shelter_names.pop(0)
+            del self.waypoints[oldest]
+            print(f"   🗑️ Removed old shelter '{oldest}'")
+
+        # Generate name
+        existing_nums = []
+        for n in self.waypoints:
+            if n.startswith("shelter"):
+                parts = n.split("_")
+                if len(parts) == 2 and parts[1].isdigit():
+                    existing_nums.append(int(parts[1]))
+                elif n == "shelter":
+                    existing_nums.append(0)
+        next_num = max(existing_nums, default=0) + 1
+        name = f"shelter_{next_num}"
+
+        result = self.save_location(name, "shelter", x, y, z, description)
+        print(f"   📍 Saved shelter as '{name}'")
+        return result
+
     # ── Auto-save from placed blocks ──
 
     def auto_save_placed(self, block_name: str, x: float, y: float, z: float) -> str:

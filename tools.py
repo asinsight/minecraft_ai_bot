@@ -37,10 +37,25 @@ def get_world_state() -> str:
         chat = data.get("recentChat", [])
         chat_str = " | ".join(f"{c['username']}: {c['message']}" for c in chat[-5:]) if chat else "no recent chat"
 
+        # Environment info
+        env = data.get('environment', 'surface')
+        env_icons = {
+            'surface': '🌍 Surface',
+            'indoors': '🏠 Indoors',
+            'underground': '⛏️ Underground (cave/mine)',
+            'deep_underground': '🕳️ Deep Underground (deepslate)',
+        }
+        env_str = env_icons.get(env, env)
+        if data.get('isDark'):
+            env_str += ' ⚠️ DARK (mobs can spawn!)'
+        if not data.get('canSeeSky') and data.get('roofHeight'):
+            env_str += f' (roof {data["roofHeight"]} blocks up)'
+
         return (
             f"Position: x={pos.get('x')}, y={pos.get('y')}, z={pos.get('z')}\n"
             f"Health: {data.get('health', '?')}/20, Hunger: {data.get('food', '?')}/20\n"
             f"Time: {data.get('time', '?')} (tick {data.get('timeOfDay', '?')})\n"
+            f"Environment: {env_str}\n"
             f"Weather: {'raining' if data.get('isRaining') else 'clear'}\n"
             f"Inventory: {inv}\n"
             f"Nearby blocks: {blocks}\n"
@@ -185,7 +200,7 @@ def move_to(x: float, y: float, z: float) -> str:
         z: Z coordinate
     """
     try:
-        r = requests.post(f"{BOT_API}/action/move", json={"x": x, "y": y, "z": z}, timeout=30)
+        r = requests.post(f"{BOT_API}/action/move", json={"x": x, "y": y, "z": z}, timeout=130)
         return r.json().get("message", "No result")
     except Exception as e:
         return f"Error: {e}"
@@ -400,10 +415,8 @@ def dig_shelter() -> str:
                 from memory_tools import memory
                 state = requests.get(f"{BOT_API}/state", timeout=5).json()
                 pos = state.get("position", {})
-                existing = [n for n in memory.waypoints if n.startswith("shelter")]
-                name = f"shelter_{len(existing) + 1}" if existing else "shelter"
-                memory.save_location(name, "shelter", float(pos["x"]), float(pos["y"]), float(pos["z"]), "Emergency underground shelter")
-                result += f" | 📍 Saved as '{name}'"
+                save_msg = memory.save_shelter(float(pos["x"]), float(pos["y"]), float(pos["z"]), "Emergency underground shelter")
+                result += f" | 📍 {save_msg}"
             except:
                 pass
         return result
@@ -461,16 +474,14 @@ def build_shelter() -> str:
         r = requests.post(f"{BOT_API}/action/build_shelter", timeout=60)
         result = r.json().get("message", "No result")
 
-        # Auto-save shelter location
+        # Auto-save shelter location (max 3)
         if "Built shelter" in result:
             try:
                 from memory_tools import memory
                 state = requests.get(f"{BOT_API}/state", timeout=5).json()
                 pos = state.get("position", {})
-                existing = [n for n in memory.waypoints if n.startswith("shelter")]
-                name = f"shelter_{len(existing) + 1}" if existing else "shelter"
-                memory.save_location(name, "shelter", float(pos["x"]), float(pos["y"]), float(pos["z"]), "Enclosed shelter")
-                result += f" | 📍 Saved as '{name}'"
+                save_msg = memory.save_shelter(float(pos["x"]), float(pos["y"]), float(pos["z"]), "Enclosed shelter")
+                result += f" | 📍 {save_msg}"
             except:
                 pass
 
@@ -510,6 +521,50 @@ def send_chat(message: str) -> str:
 # ============================================
 # ALL TOOLS LIST (imported by agent.py)
 # ============================================
+@tool
+def scan_structure(name: str, radius: int = 5) -> str:
+    """Scan and save the block structure around you. Use this to remember a shelter,
+    base, or any build so you can rebuild it later.
+
+    Args:
+        name: Name for this structure (e.g., 'my_shelter', 'main_base')
+        radius: Scan radius in blocks (default 5, max 10)
+    """
+    r = requests.post(f"{BOT_API}/action/scan_structure",
+                      json={"name": name, "radius": min(radius, 10)}, timeout=30)
+    return r.json().get("message", r.text)
+
+
+@tool
+def list_structures() -> str:
+    """List all saved structures that can be rebuilt."""
+    r = requests.get(f"{BOT_API}/action/list_structures", timeout=10)
+    data = r.json()
+    if not data.get("structures"):
+        return "No saved structures."
+    lines = []
+    for s in data["structures"]:
+        c = s["center"]
+        lines.append(f"  {s['name']}: {s['block_count']} blocks at ({c['x']}, {c['y']}, {c['z']}) radius={s['radius']}")
+    return "Saved structures:\n" + "\n".join(lines)
+
+
+@tool
+def rebuild_structure(name: str, offset_x: int = 0, offset_y: int = 0, offset_z: int = 0) -> str:
+    """Rebuild a previously scanned structure. Needs the right blocks in inventory.
+
+    Args:
+        name: Name of the saved structure to rebuild
+        offset_x: X offset from original position (0 = same spot)
+        offset_y: Y offset from original position (0 = same spot)
+        offset_z: Z offset from original position (0 = same spot)
+    """
+    r = requests.post(f"{BOT_API}/action/rebuild_structure",
+                      json={"name": name, "offset_x": offset_x, "offset_y": offset_y, "offset_z": offset_z},
+                      timeout=120)
+    return r.json().get("message", r.text)
+
+
 ALL_TOOLS = [
     # Perception
     get_world_state,
@@ -537,10 +592,13 @@ ALL_TOOLS = [
     dig_shelter,
     build_shelter,
     sleep_in_bed,
-
     # Mining
     dig_down,
     dig_tunnel,
+    # Structures
+    scan_structure,
+    list_structures,
+    rebuild_structure,
     # Communication
     send_chat,
 ]
